@@ -1,5 +1,7 @@
 # Qwen3.8 27B for DGX Spark / RTX 6000 PRO
 
+[![License: MIT](https://img.shields.io/badge/license-MIT-lightgrey)](LICENSE)
+
 Opinionated, ready-to-run scripts to serve **[unsloth/Qwen3.8-27B-NVFP4](https://huggingface.co/unsloth/Qwen3.8-27B-NVFP4)** with **vLLM** in Docker on an NVIDIA DGX Spark (GB10, aarch64). One script downloads the weights, one starts an OpenAI-compatible server, one stops it.
 
 - **NVFP4** quantized checkpoint (compressed-tensors) — 4-bit weights/activations with 8-bit groups for sensitive modules
