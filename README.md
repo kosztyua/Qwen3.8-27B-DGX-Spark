@@ -64,16 +64,18 @@ Measured on this box (details and methodology in [Benchmarks](#benchmarks)):
 
 | Workload | vLLM (`start.sh`) | SGLang (`start-sglang.sh`) |
 |---|---|---|
-| Thinking/code-heavy generation, 1 user | 28-31 tok/s | **42-49 tok/s** |
+| Thinking/code-heavy generation, 1 user | 28-31 tok/s | **~38-49 tok/s** (see note below) |
 | Plain prose, 1 user | 26.7 tok/s | 28.5 tok/s |
 | Random-content decode, 1 user | 27.5 tok/s | 26.1 tok/s |
 | Random-content decode, 4 users (aggregate) | 65.9 tok/s | **84.2 tok/s** |
 | Max context | 262k / **1M** (YaRN opt-in) | 262k |
 | Vision / video input | yes | untested here |
 | Reasoning parsing + tool calling | yes | yes |
-| `reasoning_effort` request control | yes | **ignored** (template kwarg not recognized; `enable_thinking: false` works) |
+| `reasoning_effort` request control | yes | **none: always thinks at `xhigh`** (kwarg not passed to the template; `enable_thinking: false` works) |
 
 Rule of thumb: pick SGLang when you want raw decode speed, and vLLM when you need the features (1M-token context, vision input, `reasoning_effort` control) or the serving surface this repo has exercised much harder. The speed difference comes from speculative decoding: SGLang's DSpark drafts 7-token blocks with a dedicated 1.4B drafter that accepts extremely well on predictable reasoning and code text, while vLLM uses the checkpoint's built-in MTP head (5 tokens). Speculative decoding is lossless with respect to the target model in both engines, and both serve the same unsloth NVFP4 checkpoint (the DSpark drafter is a separate BF16 speculator, not a different quant of the main model).
+
+Two caveats on the thinking-heavy row. First, tok/s is not time-to-answer: SGLang cannot lower the reasoning effort, so every thinking request pays an `xhigh`-length trace, while vLLM at `reasoning_effort: medium` or `low` generates far fewer tokens and can answer sooner despite a lower rate. (Workaround if you want SGLang with shorter thinking: pass a template with a different `reasoning_effort` default via `--chat-template`; the template supports it, only the per-request kwarg is broken.) Second, the measurement conditions were not fully matched; see the benchmark section.
 
 ## Configuration
 
@@ -154,6 +156,8 @@ Long context (single stream, 128k-token prompt, measured under the 1M-YaRN confi
 | Plain-prose continuation (template-free, greedy) | 26.7 tok/s | 28.5 tok/s |
 
 Random-content comparison (same `bench.sh` scenarios): vLLM 27.5 tok/s c=1 / 65.9 c=4 vs SGLang 26.1 / 84.2.
+
+How matched are these? The prose row and the random benchmark are strict apples-to-apples: raw `/v1/completions` prompts (no chat template, no effort setting), identical inputs, fixed generation lengths on both engines. The code and reasoning rows both rendered the template's default `xhigh` effort, but the windows differ: vLLM's answers terminated naturally at 726-780 tokens while the SGLang runs hit the 1,500-token cap mid-thinking. Acceptance improves the deeper a thinking trace goes, so the longer window flatters SGLang; runs that terminated naturally (RadixArk-target checkpoint, same flags) measured 38.3/37.5 tok/s. Read the SGLang advantage on thinking content as roughly 38-49 tok/s against vLLM's 28-31, with the top of that range the optimistic end.
 
 ### Capacity (vLLM, from the engine startup log)
 

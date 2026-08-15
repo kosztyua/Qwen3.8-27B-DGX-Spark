@@ -6,12 +6,15 @@ set -euo pipefail
 # same port, same served-model name, so clients don't care which one runs.
 #
 # Why this exists (measured on this box, see README "Choosing an engine"):
-#   - Thinking-heavy generation (reasoning traces, code): 42-49 tok/s
-#     single-stream vs ~28-31 on the vLLM setup — DSpark drafts 7-token
+#   - Thinking-heavy generation (reasoning traces, code): ~38-49 tok/s
+#     single-stream vs ~28-31 on the vLLM setup. DSpark drafts 7-token
 #     blocks with a separate 1.4B drafter that accepts extremely well on
-#     predictable reasoning text.
+#     predictable reasoning text. Note: requests always think at xhigh
+#     effort here (see limitations), so time-to-answer can still favor
+#     vLLM at a lower reasoning_effort.
 #   - Plain prose: ~28.5 tok/s vs vLLM's ~26.7 (roughly a tie).
-#   - Batched / random-content workloads favor the vLLM setup instead.
+#   - Random-content decode: c=1 roughly a tie, c=4 aggregate 84.2 vs
+#     65.9 tok/s in SGLang's favor.
 #
 # The target checkpoint is unsloth's NVFP4 (same as start.sh). The drafter,
 # RadixArk/Qwen3.8-27B-DSpark, is a separate unquantized BF16 speculator —
