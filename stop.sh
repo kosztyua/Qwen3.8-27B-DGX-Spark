@@ -1,33 +1,38 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Stop the vLLM container started by start.sh (Qwen3.8-27B-NVFP4).
+# Stop whichever engine container is running (vLLM from start.sh, SGLang from
+# start-sglang.sh). Stopped containers are left in place for `docker logs`
+# post-mortem; the next start script removes them.
 
-CONTAINER_NAME="qwen3.8-27b-nvfp4"
-PID_FILE=".vllm.pid"
-LOG_FILE=".vllm.log"
+# Anchor to the repo dir so the pid/log files are found from any cwd.
+cd "$(dirname "$0")"
 
 command -v docker >/dev/null 2>&1 || {
   echo "docker is not on PATH"
   exit 1
 }
 
-if ! docker ps -a --format '{{.Names}}' | grep -qx "${CONTAINER_NAME}"; then
-  echo "Container ${CONTAINER_NAME} does not exist; nothing to stop"
-  rm -f "${PID_FILE}"
-  exit 0
+stopped=0
+stop_one() {
+  local name="$1" pid_file="$2" log_file="$3"
+  if ! docker ps -a --format '{{.Names}}' | grep -qxF "${name}"; then
+    rm -f "${pid_file}"
+    return
+  fi
+  if docker ps --format '{{.Names}}' | grep -qxF "${name}"; then
+    echo "Stopping container ${name}..."
+    docker stop "${name}" >/dev/null
+    echo "[$(date -Is)] container stopped" >> "${log_file}"
+    echo "Stopped ${name}."
+    stopped=1
+  fi
+  rm -f "${pid_file}"
+}
+
+stop_one "qwen3.8-27b-nvfp4" ".vllm.pid" ".vllm.log"
+stop_one "qwen3.8-27b-sglang" ".sglang.pid" ".sglang.log"
+
+if [[ "${stopped}" == "0" ]]; then
+  echo "No engine container is running; nothing to stop"
 fi
-
-if docker ps --format '{{.Names}}' | grep -qx "${CONTAINER_NAME}"; then
-  echo "Stopping container ${CONTAINER_NAME}..."
-  docker stop "${CONTAINER_NAME}" >/dev/null
-  echo "[$(date -Is)] container stopped" >> "${LOG_FILE}"
-  echo "Stopped."
-else
-  echo "Container ${CONTAINER_NAME} is not running"
-fi
-
-rm -f "${PID_FILE}"
-
-# Leave the stopped container in place; start.sh removes it on next launch,
-# so `docker logs ${CONTAINER_NAME}` stays available for post-mortem.

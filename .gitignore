@@ -2,5 +2,5 @@
 .cache/
 .vllm.log
 .vllm.pid
-start.out
-dl.out
+.sglang.log
+.sglang.pid

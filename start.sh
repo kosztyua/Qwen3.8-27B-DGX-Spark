@@ -23,7 +23,8 @@ set -euo pipefail
 #     collapses to ~15 tok/s.
 #   - --cudagraph-capture-sizes must contain c*(1+k) for c=1..max-num-seqs or
 #     decode batches run attention eagerly (PR #52000): for k=5 that is
-#     6/12/18/24, for k=2 add 12 to the default ladder.
+#     6/12/18/24 (all in the ladder below); a k=2 config would need 3/6/9/12,
+#     i.e. ladder 1 2 3 4 6 8 9 12 16 24.
 #   - The checkpoint carries a calibrated FP8 kv_cache_scheme (static
 #     per-tensor scales, 2x KV memory savings). We pass --kv-cache-dtype fp8
 #     explicitly (matches vLLM's official recipe; "auto" resolves to the same
@@ -32,7 +33,7 @@ set -euo pipefail
 #
 # The repo ships its own chat_template.jinja; thinking mode and
 # preserve_thinking are ON by default (disable per request via
-# chat_template_kwargs, see model card). The model defaults to
+# chat_template_kwargs {"enable_thinking": false}). The model defaults to
 # reasoning_effort "xhigh"; for shorter thinking traces add e.g.
 #   --default-chat-template-kwargs '{"reasoning_effort": "medium"}'
 #
@@ -44,11 +45,16 @@ set -euo pipefail
 # vLLM's own defaults. For instruct / non-thinking requests, clients should
 # override per request: temperature=0.7, top_p=0.8, top_k=20, presence_penalty=1.5
 
+# Anchor all paths to the repo dir regardless of the caller's cwd (matches
+# download.sh/bench.sh, and keeps .cache/ + log/pid files in one place).
+cd "$(dirname "$0")"
+
 MODEL_ID="unsloth/Qwen3.8-27B-NVFP4"
 SERVED_MODEL_NAME="qwen38-27b-unsloth-nvfp4"
 # Pinned: vllm/vllm-openai:nightly-aarch64 as of 2026-08-15 (see header notes)
 IMAGE="vllm/vllm-openai@sha256:b5c860acda75d737a8e58cc99ba86ff13982695dceae194f906c2d7b54979358"
 CONTAINER_NAME="qwen3.8-27b-nvfp4"
+SGLANG_CONTAINER_NAME="qwen3.8-27b-sglang"
 HOST="0.0.0.0"
 PORT="8888"
 PID_FILE=".vllm.pid"
@@ -94,8 +100,14 @@ if [[ -z "${HF_TOKEN:-}" && -f "${HOME}/.bashrc" ]]; then
 fi
 export HF_TOKEN
 
-if docker ps -a --format '{{.Names}}' | grep -qx "${CONTAINER_NAME}"; then
-  if docker ps --format '{{.Names}}' | grep -qx "${CONTAINER_NAME}"; then
+# Both engines bind the same port and share the GPU: refuse to double-start.
+if docker ps --format '{{.Names}}' | grep -qxF "${SGLANG_CONTAINER_NAME}"; then
+  echo "The SGLang server (${SGLANG_CONTAINER_NAME}) is running — stop it first: ./stop.sh"
+  exit 1
+fi
+
+if docker ps -a --format '{{.Names}}' | grep -qxF "${CONTAINER_NAME}"; then
+  if docker ps --format '{{.Names}}' | grep -qxF "${CONTAINER_NAME}"; then
     echo "Container ${CONTAINER_NAME} is already running"
     echo "Log: ${LOG_FILE}"
     exit 0
@@ -114,7 +126,8 @@ cat >"${LOG_FILE}" <<EOF
 EOF
 
 # .cache/vllm holds the torch.compile artifact cache and .cache/flashinfer the
-# FlashInfer autotune cache; mounting both cuts warm restarts by ~1-2 minutes.
+# FlashInfer autotune cache; mounting both cuts warm-restart engine init from
+# ~3 min to ~30 s.
 docker run -d \
   --name "${CONTAINER_NAME}" \
   --network host \
@@ -176,21 +189,25 @@ trap cleanup EXIT
 docker logs -f "${CONTAINER_NAME}" 2>&1 | tee -a "${LOG_FILE}" &
 log_follow_pid=$!
 
+wait_ready() {
+  local heartbeat=0
+  until curl -fsS -m 5 "${READY_URL}" >/dev/null 2>&1; do
+    if ! docker ps --format '{{.Names}}' | grep -qxF "${CONTAINER_NAME}"; then
+      echo "vLLM container exited before becoming ready"
+      tail -n 200 "${LOG_FILE}" || true
+      return 1
+    fi
+    # The log itself is streaming above; only a light heartbeat every ~30s.
+    if (( heartbeat % 6 == 0 )); then
+      echo "  still starting..."
+    fi
+    heartbeat=$((heartbeat + 1))
+    sleep 5
+  done
+}
+
 echo "Waiting for HTTP readiness at ${READY_URL}"
-heartbeat=0
-until curl -fsS "${READY_URL}" >/dev/null 2>&1; do
-  if ! docker ps --format '{{.Names}}' | grep -qx "${CONTAINER_NAME}"; then
-    echo "vLLM container exited before becoming ready"
-    tail -n 200 "${LOG_FILE}" || true
-    exit 1
-  fi
-  # The log itself is streaming above; only a light heartbeat every ~30s.
-  if (( heartbeat % 6 == 0 )); then
-    echo "  still starting..."
-  fi
-  heartbeat=$((heartbeat + 1))
-  sleep 5
-done
+wait_ready || exit 1
 
 echo "vLLM is ready"
 echo "OpenAI base URL: http://${HOST}:${PORT}/v1"
@@ -202,42 +219,52 @@ echo "OpenAI base URL: http://${HOST}:${PORT}/v1"
 # A plain container restart fixes it. Probe acceptance and restart once if bad.
 probe_acceptance() {
   local before after
-  before=$(curl -s "http://127.0.0.1:${PORT}/metrics" | awk '
+  before=$(curl -fs -m 10 "http://127.0.0.1:${PORT}/metrics" | awk '
     /^vllm:spec_decode_num_accepted_tokens_per_pos_total.*position="0"/ {a=$NF}
     /^vllm:spec_decode_num_drafts_total/ {d=$NF} END {print a+0, d+0}')
   for i in 1 2 3; do
-    curl -s -m 120 "http://127.0.0.1:${PORT}/v1/chat/completions" \
+    curl -fs -m 120 "http://127.0.0.1:${PORT}/v1/chat/completions" \
       -H "Content-Type: application/json" \
       -d '{"model": "'"${SERVED_MODEL_NAME}"'", "max_tokens": 150,
            "chat_template_kwargs": {"reasoning_effort": "low"},
            "messages": [{"role": "user", "content": "Briefly describe photosynthesis, then count from 1 to 20."}]}' \
-      >/dev/null
+      >/dev/null || true
   done
-  after=$(curl -s "http://127.0.0.1:${PORT}/metrics" | awk '
+  after=$(curl -fs -m 10 "http://127.0.0.1:${PORT}/metrics" | awk '
     /^vllm:spec_decode_num_accepted_tokens_per_pos_total.*position="0"/ {a=$NF}
     /^vllm:spec_decode_num_drafts_total/ {d=$NF} END {print a+0, d+0}')
-  python3 - "$before" "$after" <<'PY'
+  # Fails closed: zero drafts (probe requests all failed, metrics unreadable,
+  # or spec decode not running at all) counts as unhealthy.
+  python3 - "${before:-0 0}" "${after:-0 0}" <<'PY'
 import sys
 a0, d0 = map(float, sys.argv[1].split())
 a1, d1 = map(float, sys.argv[2].split())
 drafts = d1 - d0
-rate = (a1 - a0) / drafts if drafts > 0 else 1.0
+if drafts <= 0:
+    print("n/a (no drafts observed)")
+    sys.exit(1)
+rate = (a1 - a0) / drafts
 print(f"{rate:.2f}")
 sys.exit(0 if rate >= 0.55 else 1)
 PY
 }
 
-echo "Probing speculative-decode health (MTP position-0 acceptance)..."
-if rate=$(probe_acceptance); then
-  echo "MTP acceptance healthy (position-0 rate ${rate})"
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "WARNING: python3 not found on the host — skipping the MTP health probe."
+  echo "If decode runs ~40% slower than expected (~16 instead of ~27 tok/s), restart with ./stop.sh && ./start.sh"
 else
-  echo "MTP acceptance degraded (position-0 rate ${rate}) — restarting container once (known per-launch initialization lottery)"
-  docker restart "${CONTAINER_NAME}" >/dev/null
-  until curl -fsS "${READY_URL}" >/dev/null 2>&1; do sleep 5; done
+  echo "Probing speculative-decode health (MTP position-0 acceptance)..."
   if rate=$(probe_acceptance); then
-    echo "MTP acceptance healthy after restart (position-0 rate ${rate})"
+    echo "MTP acceptance healthy (position-0 rate ${rate})"
   else
-    echo "WARNING: MTP acceptance still degraded (position-0 rate ${rate}); decode will run ~40% slower than optimal. Try ./stop.sh && ./start.sh"
+    echo "MTP acceptance degraded (position-0 rate ${rate}) — restarting container once (known per-launch initialization lottery)"
+    docker restart "${CONTAINER_NAME}" >/dev/null
+    wait_ready || exit 1
+    if rate=$(probe_acceptance); then
+      echo "MTP acceptance healthy after restart (position-0 rate ${rate})"
+    else
+      echo "WARNING: MTP acceptance still degraded (position-0 rate ${rate}); decode will run ~40% slower than optimal. Try ./stop.sh && ./start.sh"
+    fi
   fi
 fi
 

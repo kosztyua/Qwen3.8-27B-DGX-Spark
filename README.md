@@ -2,159 +2,106 @@
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-lightgrey)](LICENSE)
 
-Opinionated, ready-to-run scripts to serve **[unsloth/Qwen3.8-27B-NVFP4](https://huggingface.co/unsloth/Qwen3.8-27B-NVFP4)** with **vLLM** in Docker on an NVIDIA DGX Spark (GB10, aarch64). One script downloads the weights, one starts an OpenAI-compatible server, one stops it, one benchmarks it.
+Ready-to-run scripts to serve **[unsloth/Qwen3.8-27B-NVFP4](https://huggingface.co/unsloth/Qwen3.8-27B-NVFP4)** on an NVIDIA DGX Spark (GB10, aarch64), with two interchangeable engines:
 
-> Forked from [MiaAI-Lab/Qwen3.8-27B-DGX-Spark-RTX-6000](https://github.com/MiaAI-Lab/Qwen3.8-27B-DGX-Spark-RTX-6000) (the original repo, which also covers the RTX 6000 PRO). This fork is DGX-Spark-only and adds the measured performance tuning below (MTP `k=5`, CUDA-graph ladder, pinned image, spec-decode health probe).
+- **vLLM** (`./start.sh`, the default) has the full feature set: 262k or 1M context, vision, tool calling, reasoning parsing, MTP speculative decoding.
+- **SGLang + DSpark** (`./start-sglang.sh`) is roughly 50% faster at single-stream generation on thinking- and code-heavy work and has the highest batched throughput, with a shorter feature list.
 
-- **NVFP4** quantized checkpoint (compressed-tensors) — 4-bit weights/activations with 8-bit groups for sensitive modules
-- **262k-token native context** by default; the full **1M-token context** via static YaRN with `CONTEXT_1M=1 ./start.sh`
-- **FP8 KV cache** (calibrated `kv_cache_scheme` from the checkpoint, passed explicitly via `--kv-cache-dtype fp8`, ~2× KV memory savings)
-- **MTP speculative decoding** (`num_speculative_tokens: 5`) — measured fastest on this hardware: 27.5 tok/s single-stream (+15% vs `2`), 2.1× decode speed at 128k context
-- **CUDA-graph capture ladder** sized for spec decode (`c×(1+k)` for every concurrency) so decode never falls back to eager attention
-- **Pinned vLLM nightly image** (by digest) — the only vLLM that currently loads this model, with the SM12x XQA decode path an open upstream PR may remove
-- Built-in **reasoning parsing** (Qwen3 thinking mode) and **tool calling** (`qwen3_coder` parser)
+Both serve an OpenAI-compatible API on the same port with the same model name (`qwen38-27b-unsloth-nvfp4`), so clients don't care which one is running. All performance claims in this README were measured on one DGX Spark on 2026-08-15; see [Benchmarks](#benchmarks).
 
----
+> Forked from [MiaAI-Lab/Qwen3.8-27B-DGX-Spark-RTX-6000](https://github.com/MiaAI-Lab/Qwen3.8-27B-DGX-Spark-RTX-6000) (the original repo, which also covers the RTX 6000 PRO). This fork is DGX-Spark-only and adds measured performance tuning and the SGLang alternative.
 
 ## Requirements
 
 | Component | Detail |
 |---|---|
-| Hardware | NVIDIA DGX Spark / GB10 (aarch64, sm_121a) |
+| Hardware | NVIDIA DGX Spark / GB10 (aarch64, sm_121a, 128 GB unified memory) |
 | Docker | With NVIDIA Container Toolkit / GPU passthrough working (`docker run --gpus all`) |
-| vLLM image | `vllm/vllm-openai@sha256:b5c860…` (pinned 2026-08-15 nightly; stable releases cannot load this checkpoint) |
-| CLI tools | `docker`, `curl`, and the Hugging Face CLI (`hf`) for the download step |
-| Hugging Face token | `HF_TOKEN` defined in `~/.bashrc` (gated/repo access, higher rate limits) |
+| Disk | ~25 GB for checkpoints (+3 GB with `--sglang`), plus the engine images |
+| CLI tools | `docker`, `curl`, `python3` (health probe / smoke test); the Hugging Face CLI (`hf`) for `download.sh` |
+| Hugging Face token | `HF_TOKEN` defined in `~/.bashrc` (higher rate limits; not strictly required) |
+
+Engine images are **pinned by digest** in the start scripts (both are the 2026-08-15 builds validated here): `vllm/vllm-openai@sha256:b5c860…` and `lmsysorg/sglang@sha256:febfb9…`. See [Why the vLLM image is pinned](#why-the-vllm-image-is-pinned).
 
 ## Quick start
 
 ```bash
-# 1. Download the checkpoint into this directory's HF cache (retries up to 10x)
-./download.sh
+# 1. Download the checkpoint into ./.cache/huggingface (retries, resumes)
+./download.sh            # add --sglang to also fetch the DSpark drafter
 
-# 2. Start the server (waits until the HTTP API is ready, then exits)
-./start.sh
+# 2. Start ONE engine (each waits until the API is ready, then exits)
+./start.sh               # vLLM (default choice)
+# ...or
+./start-sglang.sh        # SGLang + DSpark (downloads the drafter if missing)
 
 # 3. Use it
 curl http://127.0.0.1:8888/v1/models
 
-# 4. Stop it
+# 4. Benchmark it (optional; ~10 min)
+./bench.sh mylabel
+
+# 5. Stop whichever engine is running
 ./stop.sh
 ```
 
-`start.sh` is idempotent: if the container is already running it says so and exits; if a stopped container exists it removes it first.
+The start scripts are idempotent: if their container is already running they say so and exit; a stopped leftover container is removed first. Each start script refuses to start while the other engine's container is running (same port, same GPU); run `./stop.sh` first.
 
 ## Scripts
 
 | Script | What it does |
 |---|---|
-| `download.sh` | Pre-downloads `unsloth/Qwen3.8-27B-NVFP4` into `./.cache/huggingface` with up to 10 retries (plain HTTP, xet disabled, so stalled downloads resume cleanly). Reads `HF_TOKEN` from `~/.bashrc`. |
-| `start.sh` | Launches the vLLM container (`docker run -d`, host network), streams logs to `.vllm.log`, records the container ID in `.vllm.pid`, and polls `http://127.0.0.1:8888/v1/models` until the server is ready. |
-| `stop.sh` | Stops the container, removes `.vllm.pid`, and leaves the stopped container in place for `docker logs` post-mortem (the next `start.sh` removes it). |
-| `bench.sh` | Benchmarks the running server with `vllm bench serve` (decode c=1/c=4, 16k prefill, optional 128k long-context via `--full`). Fixed seeds for cross-config comparability; results in `.cache/huggingface/bench-results/<label>/`. |
+| `download.sh` | Pre-downloads `unsloth/Qwen3.8-27B-NVFP4` (and with `--sglang` the `RadixArk/Qwen3.8-27B-DSpark` drafter) into `./.cache/huggingface`, with up to 10 attempts per repo (plain HTTP, xet disabled, so stalled downloads resume cleanly). |
+| `start.sh` | Launches the pinned vLLM container (`docker run -d`, host network), streams logs to `.vllm.log`, records the container ID in `.vllm.pid`, waits for readiness, then runs a speculative-decode health probe (see [Known issues](#tuning-notes--known-issues)). `CONTEXT_1M=1 ./start.sh` serves the 1M-token YaRN context. |
+| `start-sglang.sh` | Launches the pinned SGLang container with DSpark speculative decoding (logs to `.sglang.log`, ID in `.sglang.pid`), waits for readiness, runs a generation smoke test. |
+| `stop.sh` | Stops whichever engine container is running, removes the pid files, and leaves the stopped container in place for `docker logs` post-mortem (the next start removes it). |
+| `bench.sh` | Benchmarks whatever is serving on the port using `vllm bench serve` in a throwaway client container, so it works against both engines. Fixed seeds for cross-config comparability; results in `.cache/huggingface/bench-results/<label>/`. `--full` adds the 128k long-context scenario. |
 
-Runtime artifacts: `.vllm.log` (server log), `.vllm.pid` (container ID), `.cache/` (HF + Triton caches). All are git-ignored.
+Runtime artifacts (`.vllm.log`, `.sglang.log`, pid files, `.cache/`) are git-ignored.
+
+## Choosing an engine
+
+Measured on this box (details and methodology in [Benchmarks](#benchmarks)):
+
+| Workload | vLLM (`start.sh`) | SGLang (`start-sglang.sh`) |
+|---|---|---|
+| Thinking/code-heavy generation, 1 user | 28-31 tok/s | **42-49 tok/s** |
+| Plain prose, 1 user | 26.7 tok/s | 28.5 tok/s |
+| Random-content decode, 1 user | 27.5 tok/s | 26.1 tok/s |
+| Random-content decode, 4 users (aggregate) | 65.9 tok/s | **84.2 tok/s** |
+| Max context | 262k / **1M** (YaRN opt-in) | 262k |
+| Vision / video input | yes | untested here |
+| Reasoning parsing + tool calling | yes | yes |
+| `reasoning_effort` request control | yes | **ignored** (template kwarg not recognized; `enable_thinking: false` works) |
+
+Rule of thumb: pick SGLang when you want raw decode speed, and vLLM when you need the features (1M-token context, vision input, `reasoning_effort` control) or the serving surface this repo has exercised much harder. The speed difference comes from speculative decoding: SGLang's DSpark drafts 7-token blocks with a dedicated 1.4B drafter that accepts extremely well on predictable reasoning and code text, while vLLM uses the checkpoint's built-in MTP head (5 tokens). Speculative decoding is lossless with respect to the target model in both engines, and both serve the same unsloth NVFP4 checkpoint (the DSpark drafter is a separate BF16 speculator, not a different quant of the main model).
 
 ## Configuration
 
-Defaults live at the top of `start.sh`:
+### vLLM (`start.sh`)
 
-| Variable | Default | Notes |
+| Setting | Default | Notes |
 |---|---|---|
 | `MODEL_ID` | `unsloth/Qwen3.8-27B-NVFP4` | Checkpoint to serve |
-| `SERVED_MODEL_NAME` | `qwen38-27b-unsloth-nvfp4` | Name clients use in API requests |
-| `IMAGE` | `vllm/vllm-openai@sha256:b5c860…` | **Pinned by digest** = `nightly-aarch64` as of 2026-08-15 (`v0.27.2rc1.dev110+gacb0f1dcd`); see "Why the image is pinned" |
-| `CONTAINER_NAME` | `qwen3.8-27b-nvfp4` | Also used by `stop.sh` |
+| `SERVED_MODEL_NAME` | `qwen38-27b-unsloth-nvfp4` | Name clients use in API requests (same for both engines) |
+| `IMAGE` | `vllm/vllm-openai@sha256:b5c860…` | Pinned digest = `nightly-aarch64` of 2026-08-15 (`v0.27.2rc1.dev110`) |
 | `PORT` | `8888` | Listens on `0.0.0.0` via host networking |
-| `--gpu-memory-utilization` | `0.84` | |
-| `--max-model-len` | `262,144` (native) | `CONTEXT_1M=1 ./start.sh` serves 1,000,000 via YaRN; see notes below |
-| `--max-num-seqs` | `4` | Concurrent sequences |
-| `--speculative-config` | MTP, `num_speculative_tokens: 5` | Measured optimum on this box; see benchmark table |
-| `--cudagraph-capture-sizes` | `1 2 4 6 8 12 16 18 24` | Must contain `c×(1+k)` for `c = 1..max-num-seqs`, `k` = spec tokens |
+| `--max-model-len` | `262,144` (native) | `CONTEXT_1M=1 ./start.sh` serves 1,000,000 via YaRN |
+| `--gpu-memory-utilization` | `0.84` | ~2.2M-token FP8 KV pool |
+| `--max-num-seqs` | `4` | Concurrent sequences (extra requests queue) |
+| `--speculative-config` | MTP, `num_speculative_tokens: 5` | Measured optimum; do **not** use 3 (see Known issues) |
+| `--cudagraph-capture-sizes` | `1 2 4 6 8 12 16 18 24` | Must contain `c×(1+k)` for `c = 1..max-num-seqs` |
+| `--attention-backend` | `triton_attn` | FlashInfer is faster but mis-drafts at 4-way concurrency (see Known issues) |
+| `--kv-cache-dtype` | `fp8` | The checkpoint's calibrated FP8 KV scheme (~2× KV memory savings vs bf16) |
 
-### Context length: native 262k by default, YaRN 1M opt-in
+**Context length**: the model's native context is 262,144 tokens, served by default with no RoPE modification. `CONTEXT_1M=1 ./start.sh` applies the model card's static-YaRN recipe (factor 4.0) for 1M tokens; per the model card, static YaRN can slightly degrade short-context quality, which is why it is opt-in. Decode/prefill speed is the same either way. A single 1M-token sequence needs ~32 GB of KV; the pool covers ~8 concurrent 262k sequences or 2 × 1M.
 
-The model's native context is **262,144 tokens**, which `start.sh` serves by default — no RoPE modification, no quality caveat. For the full **1M-token** context, launch with `CONTEXT_1M=1 ./start.sh`: this applies the model card's static-YaRN recipe (factor 4.0 over the native 262,144 via `--hf-overrides`). Per the model card, static YaRN can slightly degrade short-context quality, which is why it is no longer the default. Decode/prefill speed is the same either way; the KV pool (~2.26M tokens) covers ~8× concurrent 262k-token requests or 2× 1M.
+### SGLang (`start-sglang.sh`)
 
-### Notable serving choices
-
-- **Context:** 1M tokens via static YaRN (factor 4.0 over native 262,144, applied through `--hf-overrides`). Per the model card, static YaRN can slightly impact short-context quality. With the FP8 KV cache, a single 1M-token sequence needs ~32 GB of KV; concurrent long sequences are admitted as KV space allows. Override `--kv-cache-dtype bfloat16` in `start.sh` to force a bf16 KV cache instead of the checkpoint's FP8 scheme.
-- **Quantization:** the checkpoint is dynamic NVFP4 in compressed-tensors format, hence `--quantization compressed-tensors`. Dense model (SwiGLU, no experts) — no `--moe-backend` needed. A same-hardware community A/B measured NVFP4 ~30% faster than the FP8 checkpoint on GB10 — stay on NVFP4.
-- **Speculative decoding:** unsloth ships MTP weights (`model_mtp.safetensors`), used via `--speculative-config '{"method": "mtp", "num_speculative_tokens": 5}'`. `k=5` measured fastest single-stream on this box (see benchmark table); it costs ~7% aggregate throughput at 4 concurrent streams vs `k=2`, and wins big at long context. **Do not use `k=3`** — this vLLM build mis-drafts in the 4-token decode path (single stream at `k=3`) and single-stream decode collapses to ~15 tok/s.
-- **CUDA-graph capture ladder:** with spec decode, a uniform decode batch is `c×(1+k)` tokens at concurrency `c`. Sizes missing from `--cudagraph-capture-sizes` run attention **eagerly** every step (vLLM PR #52000). The default ladder misses 12 (=4×3) at `k=2` and most sizes at other `k`, so `start.sh` passes an explicit ladder covering `c = 1..4` for `k=5`: 6/12/18/24.
-- **Multimodal:** video support enabled via `--media-io-kwargs '{"video": {"num_frames": -1}}`.
-- **Warm-restart caches:** `.cache/vllm` (torch.compile artifacts) and `.cache/flashinfer` (autotune) are mounted into the container; warm restarts skip ~35-45s of compilation.
-- **Spec-decode health probe:** this vLLM build has a per-launch initialization lottery — some starts come up with a mis-drafting speculative state (MTP position-0 acceptance ~44% instead of ~77%, single-stream decode ~16 instead of ~27 tok/s; reproducible on identical configs, fixed by a plain container restart). After readiness, `start.sh` fires three short generations, reads the acceptance counters from `/metrics`, and restarts the container once automatically if the rate is below 0.55.
-
-### Why the image is pinned
-
-`start.sh` pins `vllm/vllm-openai@sha256:b5c860acda75d737a8e58cc99ba86ff13982695dceae194f906c2d7b54979358` (= `nightly-aarch64` of 2026-08-15, `v0.27.2rc1.dev110+gacb0f1dcd`):
-
-- **Stable releases cannot load this model** — v0.27.1 and v0.25.1 fail with `'MergedColumnParallelLinear' object has no attribute 'data'`.
-- This nightly contains the model-critical perf work: the fused CUDA GDN-MTP decode kernel (#51674), the SM12x FlashInfer XQA decode path (#49718) that enables FULL CUDA graphs for speculative uniform batches, the packed-GDN decode launch fix (#52030), and the interleaved-mrope torch.compile fix (#52005).
-- An open revert (#51987) may **remove** the SM12x XQA path from later nightlies (gpt-oss produced gibberish on the Spark CI runner), so a blind re-pull can regress decode.
-
-Worth re-pinning once these merge upstream: **#52244** (restores hybrid-GDN prefix-cache hits under MTP — today MTP largely defeats prefix caching on this model, so multi-turn TTFT re-pays the full prefill), **#52000** (uniform-decode graph dispatch), **#52013** (dedicated MTP draft `lm_head`), **#50862** (FlashInfer GDN prefill on SM12x), **#51954** (GDN decode gate copies).
-
-## Attention backend note
-
-`--attention-backend triton_attn` serves the 16 full-attention layers (the other 48 are Gated DeltaNet; the vision tower runs FlashAttention). FlashInfer also supports FP8 KV on SM121 in this build and was A/B-tested: it is **+8% prefill** (1448 vs 1339 tok/s @16k) and slightly faster single-stream, **but at `k=5` / 4 concurrent streams its 24-token decode batches mis-draft** (MTP position-0 acceptance drops from 69% to 42%), which also means its verify pass is numerically suspect — the same kernel family behind upstream revert #51987. Until that settles, `triton_attn` is the safe default. `flash_attn` would require `--kv-cache-dtype bfloat16` (FA2 cannot serve FP8 KV on SM121).
-
-## Measured numbers (this box)
-
-vLLM `v0.27.2rc1.dev110+gacb0f1dcd` (pinned nightly), 1 × DGX Spark GB10, `--gpu-memory-utilization 0.84`, YaRN 1M context, FP8 KV cache. `vllm bench serve`, random dataset with fixed seeds, thinking-mode sampling (temp 1.0 / top-p 0.95 / top-k 20), `--ignore-eos`.
-
-Config sweep (2026-08-15), decode scenarios are 1k-token prompts with 1k-token generations:
-
-| Config | c=1 decode | c=4 decode (aggregate) | Prefill 8×16k, c=4 | Notes |
-|---|---|---|---|---|
-| MTP k=2 (previous default) | 23.8 tok/s | 70.7 tok/s | 1,339 tok/s | accept 2.69/step |
-| MTP k=2 + ladder 12 | — | 71.8 tok/s | — | c=4 step time −3% |
-| MTP k=3 + ladder | **14.5 tok/s** ⚠ | 73.4 tok/s | — | width-4 mis-draft bug |
-| **MTP k=5 + ladder (shipping)** | **27.5 tok/s** | 65.9 tok/s | ~1,339 tok/s | accept 3.96/step |
-| MTP k=5 + FlashInfer attn | 28.7 tok/s | **53.3 tok/s** ⚠ | 1,448 tok/s | width-24 mis-draft bug |
-| DSpark drafter (RadixArk 1.4B) | 15.9 tok/s | 41.2 tok/s | — | accept 1.89/step; see below |
-| `--max-num-batched-tokens 16384` | — | — | 1,309 tok/s | worse 16k TTFT; kept 8192 |
-
-Long-context (single stream, 128k-token prompt, 256-token generation):
-
-| | MTP k=2 | MTP k=5 (shipping) |
-|---|---|---|
-| Prefill throughput at 128k depth | ~555 tok/s | ~590 tok/s |
-| Decode at 128k context | 8.4 tok/s | **17.9 tok/s** (accept 4.48/step) |
-
-KV / concurrency (from the engine startup log):
-
-- GPU KV cache size: **~2.25M tokens** (FP8), max concurrency 2.25× @ 1M-context requests
-- Hard cap from config: **4 concurrent sequences** (`--max-num-seqs`); extra requests queue
-- Memory-wise with FP8 KV: 2 × 1M-context, ~4 × 512k, ~8 × 262k, 4 × ≤128k (config-capped)
-- Checkpoint size: 22.6 GB (`model.safetensors` + `model_mtp.safetensors`)
-- Live KV usage: `curl -s localhost:8888/metrics | grep kv_cache_usage_perc`; MTP acceptance: `grep spec_decode`
-
-Real-workload single-stream decode (same three prompts on both engines, this box, wall-clock / per-token streaming):
-
-| Engine | Code (greedy) | Reasoning (greedy) | Math (temp 0.6) |
-|---|---|---|---|
-| **vLLM MTP k=5 (this repo)** | 28.0 tok/s | 31.5 tok/s | ~31 tok/s |
-| SGLang + DSpark (see below) | **38.3 tok/s** | **37.5 tok/s** | **45.2 tok/s** |
-
-Benchmark methodology notes: MTP acceptance (and thus tok/s) is strongly content-dependent — real text accepts far better than random continuations (~89% position-0 vs ~66-77%), and run-to-run acceptance varied 2.4-2.7 at `k=2` on different random seeds. Compare configs on inter-token step time (ITL) and acceptance separately, with pinned seeds. Beware streaming-based tok/s measurements against vLLM: it flushes stream deltas in multi-token bursts, which can inflate first-token-to-last-token rates ~2× — use wall-clock or `vllm bench serve`.
-
-### SGLang + DSpark: ~30% faster single-stream, fewer features (evaluated on this box)
-
-[SGLang](https://github.com/sgl-project/sglang) with the DSpark block-drafter is the fastest known single-stream config for this model on DGX Spark, and it reproduced here: **38.3 / 37.5 / 45.2 tok/s** on code/reasoning/math prompts vs 28-31 for this repo's vLLM setup (`lmsysorg/sglang:qwen38-27b`, `RadixArk/Qwen3.8-27B-NVFP4` target + `RadixArk/Qwen3.8-27B-DSpark` 1.4B drafter, flags from [hasso5703/dgx-spark-qwen38](https://github.com/hasso5703/dgx-spark-qwen38) — a hardened one-command systemd setup and the recommended way to run it).
-
-**Using unsloth's checkpoint in SGLang** also works (`--model-path unsloth/Qwen3.8-27B-NVFP4`, same DSpark drafter — the drafter is a separate unquantized BF16 speculator, so no RadixArk quant is involved). Measured on this box: template-free real-prose decode **28.5 tok/s vs vLLM's 26.7** (nearly a tie); thinking-heavy chat generation **42-49 tok/s** (DSpark's 7-token blocks accept extremely well on reasoning traces, where vLLM MTP stays ~28-31). One integration gap: SGLang does not recognize the `reasoning_effort` kwarg in unsloth's newer chat template (`effort_kwarg=None` in its auto-detection), so requests think at `xhigh` regardless — `enable_thinking: false` still works, and a fixed template can be passed via `--chat-template` until that's resolved.
-
-Trade-offs measured/known vs this repo's vLLM setup:
-
-- On random-content benchmarks the ranking flips (SGLang 20.4 tok/s c=1 / 51.5 c=4 aggregate vs vLLM 27.5 / 65.9), and on plain prose they are ~even: the 1.4B drafter's big wins are on predictable code/reasoning text.
-- 262k context (no validated YaRN-1M recipe) and chat-template integration gaps (see above); tool-calling / vision parity should be spot-checked with your clients.
-- vLLM-native DSpark (`{"method": "dspark", ...}` with the drafter's `architectures` patched to `Qwen3DSparkModel`) launches but mis-drafts against this target (1.89/step, position-0 53% → 15.9 tok/s) and shrinks the KV pool to ~1.47M tokens — not worth it today; a vLLM-tuned Qwen3.8 drafter would change that.
+Serves the same checkpoint and model name on the same port. Key flags (community-validated GB10 setup from [hasso5703/dgx-spark-qwen38](https://github.com/hasso5703/dgx-spark-qwen38), reproduced here): `--mem-fraction-static 0.50`, `--attention-backend flashinfer`, `--speculative-algorithm DSPARK` with `RadixArk/Qwen3.8-27B-DSpark` (block size 7, drafter unquantized), `--enable-torch-compile`, `--num-continuous-decode-steps 2`, and hard `--memory 100g` caps so a runaway allocation cannot freeze the GB10's unified memory. First boot spends ~5-9 minutes in `torch.compile`; the cache under `.cache/sglang/` makes later boots faster. If you want a production SGLang deployment (systemd, API key, Anthropic-compatible endpoint, Claude Code integration), use the hasso5703 repo directly.
 
 ## Using the API
 
-OpenAI-compatible base URL: `http://127.0.0.1:8888/v1` (model name: `qwen38-27b-unsloth-nvfp4`).
+OpenAI-compatible base URL: `http://127.0.0.1:8888/v1`, model name `qwen38-27b-unsloth-nvfp4` (both engines).
 
 ```bash
 curl http://127.0.0.1:8888/v1/chat/completions \
@@ -165,48 +112,117 @@ curl http://127.0.0.1:8888/v1/chat/completions \
   }'
 ```
 
-**Thinking mode** is on by default (`--reasoning-parser qwen3` separates `<think>` blocks into `reasoning_content`). Default sampling params (from the repo's `generation_config.json`): `temperature=1.0, top_p=0.95, top_k=20`.
+- **Thinking mode** is on by default; the `qwen3` reasoning parser separates `<think>` blocks into `reasoning_content`. Disable it per request with `"chat_template_kwargs": {"enable_thinking": false}`.
+- **Reasoning effort** defaults to `xhigh`, which produces very long thinking traces, often the dominant share of end-to-end latency. On vLLM, lower it per request with `"chat_template_kwargs": {"reasoning_effort": "medium"}` (or `"low"`), or server-wide by adding `--default-chat-template-kwargs '{"reasoning_effort": "medium"}'` to `start.sh`. On SGLang this kwarg is currently ignored (only the `enable_thinking` toggle works).
+- **Sampling defaults** come from the checkpoint's `generation_config.json`: `temperature=1.0, top_p=0.95, top_k=20` (thinking mode). For non-thinking / instruct requests the model card recommends `temperature=0.7, top_p=0.8, top_k=20, presence_penalty=1.5` together with `enable_thinking: false`.
+- **Tool calling** is enabled on both engines (`qwen3_coder` parser + auto tool choice on vLLM); pass `tools` / `tool_choice` as in the OpenAI API.
 
-For **non-thinking / instruct** requests, override per request (per the model card) — disable thinking via `chat_template_kwargs` and use:
+## Benchmarks
 
-```json
-{
-  "model": "qwen38-27b-unsloth-nvfp4",
-  "messages": [{"role": "user", "content": "Write a haiku about GB10."}],
-  "temperature": 0.7,
-  "top_p": 0.8,
-  "top_k": 20,
-  "presence_penalty": 1.5,
-  "chat_template_kwargs": { "thinking": false }
-}
-```
+All numbers: 1 × DGX Spark GB10, 2026-08-15, both engines serving `unsloth/Qwen3.8-27B-NVFP4`. Two kinds of measurements:
 
-Tool calling is enabled (`--tool-call-parser qwen3_coder --enable-auto-tool-choice`); pass `tools` / `tool_choice` as in the OpenAI API.
+- **Random-content** (`./bench.sh`): `vllm bench serve`, random dataset, fixed seeds, thinking-mode sampling (temp 1.0 / top-p 0.95 / top-k 20), `--ignore-eos`. Comparable and repeatable, but speculative acceptance on random continuations is *lower* than on real text, so these understate real-use decode speed.
+- **Real-workload**: fixed code/reasoning/prose prompts, wall-clock timing. These are the numbers you'll feel in interactive use.
 
-**Reasoning effort:** the chat template defaults to `reasoning_effort: "xhigh"`, which produces very long thinking traces — often the dominant share of end-to-end latency. Lower it per request via `chat_template_kwargs: {"reasoning_effort": "medium"}` (or `"low"`), or server-wide by adding `--default-chat-template-kwargs '{"reasoning_effort": "medium"}'` to `start.sh`.
+### vLLM config sweep (random-content, measured under the 1M-YaRN config)
 
-## Logs & troubleshooting
+Decode scenarios are 1k-token prompts with 1k-token generations; "accept" is tokens emitted per engine step (max `k+1`).
 
-- Tail the server log: `tail -f .vllm.log` (or `docker logs -f qwen3.8-27b-nvfp4`)
-- `start.sh` prints the last 200 log lines and exits if the container dies before becoming ready
-- If startup fails with CUDA/arch errors, confirm you're on the pinned aarch64 image (the container sets `CUTE_DSL_ARCH=sm_121a` for GB10's cutlass kernels)
-- Model download stalls: just re-run `./download.sh`; it resumes
-- **Day-1 tokenizer bug:** checkpoints downloaded before 2026-08-15 shipped a `tokenizer.json` that silently truncated every prompt to 2,048 tokens. Verify yours is fixed: `python3 -c "import json,glob; print(json.load(open(glob.glob('.cache/huggingface/hub/models--unsloth--Qwen3.8-27B-NVFP4/snapshots/*/tokenizer.json')[0]))['truncation'])"` must print `None`; if not, re-run `./download.sh`
-- **Multi-turn TTFT:** with MTP on, prefix caching gets almost no hits on this hybrid-GDN model (vLLM PR #52244 tracks the fix), so each turn re-pays the full prefill for now
+| Config | c=1 decode | c=4 decode (aggregate) | Prefill 8×16k, c=4 | Notes |
+|---|---|---|---|---|
+| MTP k=2 (upstream default) | 23.8 tok/s | 70.7 tok/s | 1,339 tok/s | accept 2.69 |
+| MTP k=2 + ladder fix | — | 71.8 tok/s | — | c=4 step time −3% |
+| MTP k=3 + ladder | 14.5 tok/s ⚠ | 73.4 tok/s | — | mis-draft bug, see Known issues |
+| **MTP k=5 + ladder (shipping)** | **27.5 tok/s** | 65.9 tok/s | ~1,339 tok/s | accept 3.96 |
+| MTP k=5 + FlashInfer attention | 28.7 tok/s | 53.3 tok/s ⚠ | 1,448 tok/s | mis-draft bug, see Known issues |
+| DSpark drafter inside vLLM | 15.9 tok/s | 41.2 tok/s | — | accept 1.89; not viable in vLLM today |
+| k=5 + `--max-num-batched-tokens 16384` | — | — | 1,309 tok/s | worse 16k TTFT than 8192; not shipped |
+
+Long context (single stream, 128k-token prompt, measured under the 1M-YaRN config; native-262k should be the same or better):
+
+| | MTP k=2 | MTP k=5 (shipping) |
+|---|---|---|
+| Prefill throughput at 128k depth | ~555 tok/s | ~590 tok/s |
+| Decode at 128k context | 8.4 tok/s | **17.9 tok/s** |
+
+### Engine comparison (real workloads, single stream)
+
+| Prompt type | vLLM MTP k=5 | SGLang + DSpark |
+|---|---|---|
+| Code task (greedy, thinking) | 28.0 tok/s | **42.5 tok/s** |
+| Reasoning task (greedy, thinking) | 31.5 tok/s | **49.1 tok/s** |
+| Plain-prose continuation (template-free, greedy) | 26.7 tok/s | 28.5 tok/s |
+
+Random-content comparison (same `bench.sh` scenarios): vLLM 27.5 tok/s c=1 / 65.9 c=4 vs SGLang 26.1 / 84.2.
+
+### Capacity (vLLM, from the engine startup log)
+
+- GPU KV cache pool: **~2.2M tokens** (FP8) at `--gpu-memory-utilization 0.84`
+- Memory-wise: 2 × 1M-context, ~4 × 512k, ~8 × 262k concurrent sequences; the config caps at 4 concurrent (`--max-num-seqs`)
+- Checkpoint size: 22.6 GB (`model.safetensors` + `model_mtp.safetensors`); DSpark drafter +2.7 GB
+- Live KV usage: `curl -s localhost:8888/metrics | grep kv_cache_usage_perc`; MTP acceptance: `… | grep spec_decode`
+
+### Methodology warnings
+
+- Speculative acceptance (and therefore tok/s) is strongly content-dependent. Compare configs on step time (ITL) and acceptance length separately. `bench.sh` pins its seeds so prompts are identical across runs.
+- Don't measure vLLM throughput from streaming timestamps: it flushes stream deltas in multi-token bursts, which can inflate first-token-to-last-token rates about 2×. Use wall-clock timing or `bench.sh`.
+- Restart the server between config comparisons so the prefix cache is cold.
+
+## Tuning notes & known issues
+
+### Why the vLLM image is pinned
+
+`start.sh` pins `vllm/vllm-openai@sha256:b5c860acda75d737a8e58cc99ba86ff13982695dceae194f906c2d7b54979358` (= `nightly-aarch64` of 2026-08-15, `v0.27.2rc1.dev110+gacb0f1dcd`):
+
+- **Stable vLLM releases cannot load this model**: v0.27.1 and v0.25.1 fail with `'MergedColumnParallelLinear' object has no attribute 'data'`. Do not "upgrade" to stable.
+- This nightly contains the work the model depends on: the fused CUDA GDN-MTP decode kernel (#51674), the SM12x FlashInfer XQA decode path (#49718), the packed-GDN decode launch fix (#52030), and the interleaved-mrope torch.compile fix (#52005).
+- An open revert (#51987) may remove the SM12x XQA path from later nightlies, so a blind re-pull can regress decode.
+
+Worth re-evaluating the pin once these merge upstream: **#52244** (prefix-cache hits under MTP), #52000 (uniform-decode graph dispatch), #52013 (dedicated MTP draft `lm_head`), #50862 (FlashInfer GDN prefill on SM12x), #51954 (GDN decode gate copies).
+
+### Speculative decoding on this vLLM build
+
+- **`num_speculative_tokens: 5` is the measured optimum** for interactive use: +15% single-stream over k=2 and 2.1× decode speed at 128k context, for about 7% less aggregate throughput at 4 concurrent streams. For pure 4-way batch work k=2 is slightly better; give it ladder `1 2 3 4 6 8 9 12 16 24` so 3/6/9/12 are covered (see the ladder rule below).
+- **Do not use `k=3`**: this build mis-drafts in the single-stream decode path at k=3 and c=1 decode collapses to about 15 tok/s (reproduced twice).
+- **CUDA-graph capture ladder**: with spec decode, a uniform decode batch is `c×(1+k)` tokens at concurrency `c`; sizes missing from `--cudagraph-capture-sizes` run attention eagerly every step (PR #52000). `start.sh` ships an explicit ladder covering `c = 1..4` at `k=5` (6/12/18/24).
+- **Launch lottery + health probe**: some launches of this build come up with a mis-drafting speculative state (MTP position-0 acceptance around 44% instead of 77%, single-stream decode around 16 instead of 27 tok/s) on a bit-identical config, and a plain container restart fixes it. After readiness, `start.sh` fires three short generations, reads the acceptance counters from `/metrics`, and restarts the container once automatically if the position-0 rate is below 0.55.
+- **Attention backend**: `triton_attn` serves the 16 full-attention layers (the other 48 are Gated DeltaNet; the vision tower runs FlashAttention). FlashInfer was A/B-tested: +8% prefill and slightly faster single-stream, but at 4-way concurrency its spec-decode batches mis-draft (acceptance drops from 3.51 to 2.41 per step and c=4 falls to 53.3 tok/s). That is the same kernel family as upstream revert #51987, so `triton_attn` stays the default until that settles.
+- **Prefix caching is currently defeated by MTP** on this hybrid-GDN model (PR #52244 tracks the fix), so multi-turn conversations re-pay the full prefill each turn.
+
+### Other notes
+
+- **Quantization**: NVFP4 in compressed-tensors format (`--quantization compressed-tensors`); dense model, no MoE flags. A same-hardware community A/B measured NVFP4 about 30% faster than the FP8 checkpoint on GB10, so stay on NVFP4.
+- **Warm restarts**: `.cache/vllm` (torch.compile) and `.cache/flashinfer` (autotune) are mounted into the vLLM container; engine init drops from about 3 minutes to about 30 seconds on a warm restart. SGLang keeps its inductor cache under `.cache/sglang/`.
+- **Multimodal**: vLLM serves image/video input (`--media-io-kwargs '{"video": {"num_frames": -1}}'`).
+
+## Troubleshooting
+
+- Tail the server log with `tail -f .vllm.log` or `tail -f .sglang.log` (or `docker logs -f <container>`).
+- The start scripts print the last 200 log lines and exit if the container dies before becoming ready.
+- CUDA/arch errors at startup: confirm you're on the pinned images (the vLLM container sets `CUTE_DSL_ARCH=sm_121a` for GB10).
+- Download stalls: re-run `./download.sh`; it resumes.
+- Port already in use or won't start: `./stop.sh` (stops either engine), then start again.
+- Slow decode right after a vLLM start (about 16 tok/s single-stream): the launch lottery drew badly and the probe's one retry wasn't enough. Run `./stop.sh && ./start.sh` again.
+- Day-1 tokenizer bug: checkpoints downloaded before 2026-08-15 shipped a `tokenizer.json` that silently truncated every prompt to 2,048 tokens. Verify with `python3 -c "import json,glob; print(json.load(open(glob.glob('.cache/huggingface/hub/models--unsloth--Qwen3.8-27B-NVFP4/snapshots/*/tokenizer.json')[0]))['truncation'])"`; it must print `None`. Otherwise re-run `./download.sh`.
 
 ## Repository layout
 
 ```
 .
-├── download.sh   # fetch checkpoint into ./.cache/huggingface (retrying)
-├── start.sh      # launch vLLM container, wait for readiness
-├── stop.sh       # stop the container, clean up pid file
-├── bench.sh      # benchmark the running server (vllm bench serve)
-├── .gitignore    # excludes .cache/, logs, pid file
+├── download.sh       # fetch checkpoint(s) into ./.cache/huggingface (retrying)
+├── start.sh          # serve with vLLM (default engine)
+├── start-sglang.sh   # serve with SGLang + DSpark (alternative engine)
+├── stop.sh           # stop whichever engine is running
+├── bench.sh          # benchmark whatever is serving (works with both engines)
+├── .gitignore        # excludes .cache/, logs, pid files
+├── LICENSE
 └── README.md
 ```
 
 ## Credits
 
-- [unsloth/Qwen3.8-27B-NVFP4](https://huggingface.co/unsloth/Qwen3.8-27B-NVFP4) — quantized checkpoint and docs (YaRN long-context recipe, MTP spec decode, sampling recommendations)
-- [vLLM](https://github.com/vllm-project/vllm) — inference engine and OpenAI-compatible server
+- [unsloth/Qwen3.8-27B-NVFP4](https://huggingface.co/unsloth/Qwen3.8-27B-NVFP4): quantized checkpoint and docs (YaRN long-context recipe, MTP spec decode, sampling recommendations)
+- [vLLM](https://github.com/vllm-project/vllm) and [SGLang](https://github.com/sgl-project/sglang): the inference engines
+- [RadixArk/Qwen3.8-27B-DSpark](https://huggingface.co/RadixArk/Qwen3.8-27B-DSpark): the DSpark block-speculative drafter
+- [hasso5703/dgx-spark-qwen38](https://github.com/hasso5703/dgx-spark-qwen38): validated SGLang GB10 flags, and the place to go for a hardened systemd SGLang deployment
+- [MiaAI-Lab/Qwen3.8-27B-DGX-Spark-RTX-6000](https://github.com/MiaAI-Lab/Qwen3.8-27B-DGX-Spark-RTX-6000): the original repo this fork is based on
