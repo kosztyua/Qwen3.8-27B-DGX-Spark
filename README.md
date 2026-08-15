@@ -144,10 +144,12 @@ Benchmark methodology notes: MTP acceptance (and thus tok/s) is strongly content
 
 [SGLang](https://github.com/sgl-project/sglang) with the DSpark block-drafter is the fastest known single-stream config for this model on DGX Spark, and it reproduced here: **38.3 / 37.5 / 45.2 tok/s** on code/reasoning/math prompts vs 28-31 for this repo's vLLM setup (`lmsysorg/sglang:qwen38-27b`, `RadixArk/Qwen3.8-27B-NVFP4` target + `RadixArk/Qwen3.8-27B-DSpark` 1.4B drafter, flags from [hasso5703/dgx-spark-qwen38](https://github.com/hasso5703/dgx-spark-qwen38) — a hardened one-command systemd setup and the recommended way to run it).
 
+**Using unsloth's checkpoint in SGLang** also works (`--model-path unsloth/Qwen3.8-27B-NVFP4`, same DSpark drafter — the drafter is a separate unquantized BF16 speculator, so no RadixArk quant is involved). Measured on this box: template-free real-prose decode **28.5 tok/s vs vLLM's 26.7** (nearly a tie); thinking-heavy chat generation **42-49 tok/s** (DSpark's 7-token blocks accept extremely well on reasoning traces, where vLLM MTP stays ~28-31). One integration gap: SGLang does not recognize the `reasoning_effort` kwarg in unsloth's newer chat template (`effort_kwarg=None` in its auto-detection), so requests think at `xhigh` regardless — `enable_thinking: false` still works, and a fixed template can be passed via `--chat-template` until that's resolved.
+
 Trade-offs measured/known vs this repo's vLLM setup:
 
-- On random-content benchmarks the ranking flips (SGLang 20.4 tok/s c=1 / 51.5 c=4 aggregate vs vLLM 27.5 / 65.9): the 1.4B drafter only shines on predictable real text.
-- 262k context (no validated YaRN-1M recipe), a different quantizer's NVFP4 checkpoint, and a patched chat template; tool-calling / vision parity should be spot-checked with your clients.
+- On random-content benchmarks the ranking flips (SGLang 20.4 tok/s c=1 / 51.5 c=4 aggregate vs vLLM 27.5 / 65.9), and on plain prose they are ~even: the 1.4B drafter's big wins are on predictable code/reasoning text.
+- 262k context (no validated YaRN-1M recipe) and chat-template integration gaps (see above); tool-calling / vision parity should be spot-checked with your clients.
 - vLLM-native DSpark (`{"method": "dspark", ...}` with the drafter's `architectures` patched to `Qwen3DSparkModel`) launches but mis-drafts against this target (1.89/step, position-0 53% → 15.9 tok/s) and shrinks the KV pool to ~1.47M tokens — not worth it today; a vLLM-tuned Qwen3.8 drafter would change that.
 
 ## Using the API
