@@ -7,7 +7,8 @@ cd "$(dirname "$0")"
 
 REPOS=("unsloth/Qwen3.8-27B-NVFP4")
 if [[ "${1:-}" == "--sglang" ]]; then
-  REPOS+=("RadixArk/Qwen3.8-27B-DSpark")
+  # SGLang serves the RadixArk modelopt checkpoint plus the DSpark drafter.
+  REPOS+=("RadixArk/Qwen3.8-27B-NVFP4" "RadixArk/Qwen3.8-27B-DSpark")
 fi
 
 # Honor an HF_TOKEN already in the environment; fall back to ~/.bashrc

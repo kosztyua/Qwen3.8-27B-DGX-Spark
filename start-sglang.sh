@@ -1,66 +1,69 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# unsloth/Qwen3.8-27B-NVFP4 on SGLang with DSpark block-speculative decoding
-# (DGX Spark / GB10, aarch64). Alternative engine to start.sh — same model,
-# same port, same served-model name, so clients don't care which one runs.
+# Qwen3.8-27B on SGLang with DSpark block-speculative decoding (DGX Spark /
+# GB10, aarch64). Alternative engine to start.sh — same port, but a
+# DIFFERENT checkpoint and served-model name (see below).
 #
-# ############################ EXPERIMENTAL ################################
-# STATUS 2026-08-15: BROKEN with this checkpoint. Thinking-mode output
-# degrades into hard repetition loops on ordinary prompts, even with the
-# model card's recommended sampling (temp 1.0 / top_p 0.95 / top_k 20), and
-# both with and without strict rejection-sampling verification. Suspected
+# Default target: RadixArk/Qwen3.8-27B-NVFP4 (modelopt format), the only
+# checkpoint SGLang serves correctly today. Validated on this box 2026-08-16:
+# 30+ battery runs with zero repetition loops and zero non-terminating
+# responses (greedy included), correct answers throughout, ~34-45 tok/s
+# single-stream on real content.
+#
+# SGLANG_TARGET=unsloth serves unsloth/Qwen3.8-27B-NVFP4 instead, but that
+# path is BROKEN (2026-08-15): thinking-mode output collapses into hard
+# repetition loops regardless of sampling or verification mode. Suspected
 # cause: SGLang's partial support for unsloth's compressed-tensors mixed
-# NVFP4/FP8 scheme (startup logs "Falling back to UnquantizedLinearMethod"
-# and allocates a bf16 KV cache instead of the checkpoint's calibrated FP8
-# scheme). The community-validated SGLang path uses the RadixArk modelopt
-# checkpoint instead (see hasso5703/dgx-spark-qwen38). During further
-# isolation testing the machine hard-froze from unified-memory pressure
-# despite the --memory caps below. Full details in the README's "SGLang
-# status" section. Requires SGLANG_EXPERIMENTAL=1 to run.
-# ##########################################################################
-#
-# What made this path interesting: it measured ~38-49 tok/s single-stream on
-# thinking-heavy content vs ~28-31 for vLLM, and 84.2 tok/s aggregate at 4
-# streams vs 65.9 — but the thinking-heavy numbers are contaminated by the
-# repetition loops (loops draft near-perfectly), so treat them as invalid
-# until the output quality is fixed.
+# NVFP4/FP8 scheme (logs "Falling back to UnquantizedLinearMethod", bf16 KV
+# instead of the calibrated FP8 scheme). It therefore additionally requires
+# SGLANG_EXPERIMENTAL=1. Full story in the README's "SGLang status" section.
 #
 # Known limitations vs start.sh (details in README):
 #   - Context is the native 262,144 tokens; no validated YaRN-1M recipe.
-#   - SGLang does not recognize the `reasoning_effort` template kwarg of
-#     unsloth's chat template, so requests think at the model's default
-#     (xhigh) effort; `chat_template_kwargs: {"enable_thinking": false}`
-#     works to disable thinking entirely.
+#   - The `reasoning_effort` template kwarg is not passed through, so
+#     requests think at the model's default (xhigh) effort;
+#     `chat_template_kwargs: {"enable_thinking": false}` works.
 #
-# Flags follow the community GB10 setup (hasso5703/dgx-spark-qwen38); the
-# hard --memory caps reduce (but on this box did not eliminate) the risk of
-# a unified-memory hard freeze.
+# Flags follow the community GB10 setup (hasso5703/dgx-spark-qwen38). The
+# hard --memory caps reduce, but do not eliminate, the GB10 unified-memory
+# freeze risk (one hard freeze observed on this box during a cold SGLang
+# boot); the pre-flight below refuses to start unless the memory that the
+# other engine held has actually been released.
 
 # Anchor all paths to the repo dir regardless of the caller's cwd (matches
 # download.sh/bench.sh, and keeps .cache/ + log/pid files in one place).
 cd "$(dirname "$0")"
 
-if [[ "${SGLANG_EXPERIMENTAL:-0}" != "1" ]]; then
-  cat <<'MSG'
-start-sglang.sh is currently EXPERIMENTAL AND BROKEN with this checkpoint:
-thinking-mode output degrades into repetition loops (even at the recommended
-sampling settings), and a test run hard-froze this machine from unified-memory
-pressure. See the "SGLang status" section of the README for the full story.
-
-If you want to run it anyway (e.g. to retest after an SGLang update):
-
-    SGLANG_EXPERIMENTAL=1 ./start-sglang.sh
-
-For working SGLang serving of this model today, use the RadixArk modelopt
-checkpoint via https://github.com/hasso5703/dgx-spark-qwen38 instead.
-MSG
-  exit 1
-fi
-
-MODEL_ID="unsloth/Qwen3.8-27B-NVFP4"
 DRAFT_ID="RadixArk/Qwen3.8-27B-DSpark"
-SERVED_MODEL_NAME="qwen38-27b-unsloth-nvfp4"
+case "${SGLANG_TARGET:-radixark}" in
+  radixark)
+    MODEL_ID="RadixArk/Qwen3.8-27B-NVFP4"
+    SERVED_MODEL_NAME="qwen38-27b-radixark-nvfp4"
+    ;;
+  unsloth)
+    if [[ "${SGLANG_EXPERIMENTAL:-0}" != "1" ]]; then
+      cat <<'MSG'
+SGLANG_TARGET=unsloth is EXPERIMENTAL AND BROKEN: thinking-mode output
+degrades into repetition loops (even at the recommended sampling settings).
+See the "SGLang status" section of the README for the full story.
+
+To retest it anyway (e.g. after an SGLang update):
+
+    SGLANG_TARGET=unsloth SGLANG_EXPERIMENTAL=1 ./start-sglang.sh
+
+Or just run ./start-sglang.sh for the working RadixArk checkpoint.
+MSG
+      exit 1
+    fi
+    MODEL_ID="unsloth/Qwen3.8-27B-NVFP4"
+    SERVED_MODEL_NAME="qwen38-27b-unsloth-nvfp4"
+    ;;
+  *)
+    echo "Unknown SGLANG_TARGET '${SGLANG_TARGET}' (expected 'radixark' or 'unsloth')"
+    exit 1
+    ;;
+esac
 # Pinned: lmsysorg/sglang:qwen38-27b as of 2026-08-15 (validated on this box)
 IMAGE="lmsysorg/sglang@sha256:febfb971c7352570fc445c466ebd6ffc9d896024958e544a60f2137fd85856b1"
 CONTAINER_NAME="qwen3.8-27b-sglang"
@@ -100,16 +103,37 @@ if docker ps -a --format '{{.Names}}' | grep -qxF "${CONTAINER_NAME}"; then
   docker rm "${CONTAINER_NAME}" >/dev/null
 fi
 
-# The DSpark drafter (~2.7 GB) is fetched by ./download.sh --sglang; fetch it
-# here too if missing so this script works standalone.
-if ! ls "${HF_HOME}"/hub/models--RadixArk--Qwen3.8-27B-DSpark/snapshots/*/model.safetensors >/dev/null 2>&1; then
-  echo "DSpark drafter not in cache — downloading ${DRAFT_ID} (~2.7 GB)"
-  docker run --rm --network host \
-    -e HF_HOME=/root/.cache/huggingface -e HF_TOKEN="${HF_TOKEN:-}" \
-    -v "${HF_HOME}:/root/.cache/huggingface" \
-    --entrypoint python3 "${IMAGE}" \
-    -c "from huggingface_hub import snapshot_download; snapshot_download('${DRAFT_ID}')"
+# Memory pre-flight. SGLang startup (weights + torch.compile + CUDA-graph
+# capture) needs most of the GB10's unified memory, and the container
+# --memory caps do not fully account GPU allocations — booting while the
+# other engine's memory is still held can hard-freeze the whole machine
+# (observed once on this box). Wait for the memory to be actually released.
+echo "Waiting for >= 100 GiB of available memory before booting..."
+for i in $(seq 1 24); do
+  mem_avail=$(awk '/MemAvailable/{print int($2/1048576)}' /proc/meminfo)
+  if [ "${mem_avail}" -ge 100 ]; then break; fi
+  sleep 5
+done
+if [ "${mem_avail}" -lt 100 ]; then
+  echo "Only ${mem_avail} GiB available after 2 minutes — refusing to boot to protect the host."
+  echo "Stop whatever is using the memory (./stop.sh for the other engine) and retry."
+  exit 1
 fi
+echo "OK: ${mem_avail} GiB available"
+
+# Fetch the target checkpoint and the DSpark drafter (~2.7 GB) if missing,
+# so this script works standalone (./download.sh --sglang also gets both).
+for repo in "${MODEL_ID}" "${DRAFT_ID}"; do
+  cache_dir="${HF_HOME}/hub/models--${repo//\//--}"
+  if ! ls "${cache_dir}"/snapshots/*/*.safetensors >/dev/null 2>&1; then
+    echo "${repo} not in cache — downloading"
+    docker run --rm --network host \
+      -e HF_HOME=/root/.cache/huggingface -e HF_TOKEN="${HF_TOKEN:-}" \
+      -v "${HF_HOME}:/root/.cache/huggingface" \
+      --entrypoint python3 "${IMAGE}" \
+      -c "from huggingface_hub import snapshot_download; snapshot_download('${repo}')"
+  fi
+done
 
 echo "Starting SGLang container for ${MODEL_ID} (NVFP4, DSpark speculative decoding)"
 echo "Image: ${IMAGE}"

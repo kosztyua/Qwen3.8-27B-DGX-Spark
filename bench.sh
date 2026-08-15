@@ -5,7 +5,9 @@
 # engine is serving. Results land in .cache/huggingface/bench-results/<label>/.
 #
 #   ./bench.sh <label> [--full] [--scenarios dec1,dec4,pre16k,long128k]
-#                      [--port 8888] [--model qwen38-27b-unsloth-nvfp4]
+#                      [--port 8888] [--model NAME]
+# The served model name is auto-detected from /v1/models unless --model is
+# given (the two engines serve different names).
 #
 # Scenarios (random dataset, thinking-mode sampling, fixed seeds so prompts
 # are identical across runs; restart the server between configs so the prefix
@@ -30,7 +32,7 @@ LABEL="${1:?usage: bench.sh <label> [--full] [--scenarios dec1,dec4,...] [--port
 shift
 SCENARIOS="dec1,dec4,pre16k"
 PORT="8888"
-MODEL="qwen38-27b-unsloth-nvfp4"
+MODEL=""   # default: auto-detect from the server's /v1/models
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --full) SCENARIOS="dec1,dec4,pre16k,long128k"; shift ;;
@@ -52,6 +54,13 @@ mkdir -p "${HOST_RESULTS}"
 if ! curl -fsS -m 5 "http://127.0.0.1:${PORT}/v1/models" >/dev/null 2>&1; then
   echo "No server responding on http://127.0.0.1:${PORT} — start one with ./start.sh or ./start-sglang.sh"
   exit 1
+fi
+
+# The two engines serve different model names; ask the server which it is.
+if [[ -z "${MODEL}" ]]; then
+  MODEL=$(curl -fsS -m 5 "http://127.0.0.1:${PORT}/v1/models" \
+    | python3 -c "import json,sys; print(json.load(sys.stdin)['data'][0]['id'])")
+  [[ -n "${MODEL}" ]] || { echo "Could not detect the served model name; pass --model"; exit 1; }
 fi
 
 failures=0
