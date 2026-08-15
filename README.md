@@ -4,8 +4,8 @@
 
 Ready-to-run scripts to serve **[unsloth/Qwen3.8-27B-NVFP4](https://huggingface.co/unsloth/Qwen3.8-27B-NVFP4)** on an NVIDIA DGX Spark (GB10, aarch64), with two interchangeable engines:
 
-- **vLLM** (`./start.sh`, the default) has the full feature set: 262k or 1M context, vision, tool calling, reasoning parsing, MTP speculative decoding.
-- **SGLang + DSpark** (`./start-sglang.sh`) is roughly 50% faster at single-stream generation on thinking- and code-heavy work and has the highest batched throughput, with a shorter feature list.
+- **vLLM** (`./start.sh`, the default and the only engine currently recommended) has the full feature set: 262k or 1M context, vision, tool calling, reasoning parsing, MTP speculative decoding.
+- **SGLang + DSpark** (`./start-sglang.sh`) measured much faster but **currently produces broken output with this checkpoint** and is gated behind `SGLANG_EXPERIMENTAL=1`; see [SGLang status](#sglang-status-broken-with-this-checkpoint) before touching it.
 
 Both serve an OpenAI-compatible API on the same port with the same model name (`qwen38-27b-unsloth-nvfp4`), so clients don't care which one is running. All performance claims in this README were measured on one DGX Spark on 2026-08-15; see [Benchmarks](#benchmarks).
 
@@ -29,10 +29,10 @@ Engine images are **pinned by digest** in the start scripts (both are the 2026-0
 # 1. Download the checkpoint into ./.cache/huggingface (retries, resumes)
 ./download.sh            # add --sglang to also fetch the DSpark drafter
 
-# 2. Start ONE engine (each waits until the API is ready, then exits)
-./start.sh               # vLLM (default choice)
-# ...or
-./start-sglang.sh        # SGLang + DSpark (downloads the drafter if missing)
+# 2. Start the server (waits until the API is ready, then exits)
+./start.sh               # vLLM (the recommended engine)
+# The SGLang alternative is currently broken with this checkpoint and gated:
+# SGLANG_EXPERIMENTAL=1 ./start-sglang.sh   (see "SGLang status" below)
 
 # 3. Use it
 curl http://127.0.0.1:8888/v1/models
@@ -52,30 +52,23 @@ The start scripts are idempotent: if their container is already running they say
 |---|---|
 | `download.sh` | Pre-downloads `unsloth/Qwen3.8-27B-NVFP4` (and with `--sglang` the `RadixArk/Qwen3.8-27B-DSpark` drafter) into `./.cache/huggingface`, with up to 10 attempts per repo (plain HTTP, xet disabled, so stalled downloads resume cleanly). |
 | `start.sh` | Launches the pinned vLLM container (`docker run -d`, host network), streams logs to `.vllm.log`, records the container ID in `.vllm.pid`, waits for readiness, then runs a speculative-decode health probe (see [Known issues](#tuning-notes--known-issues)). `CONTEXT_1M=1 ./start.sh` serves the 1M-token YaRN context. |
-| `start-sglang.sh` | Launches the pinned SGLang container with DSpark speculative decoding (logs to `.sglang.log`, ID in `.sglang.pid`), waits for readiness, runs a generation smoke test. |
+| `start-sglang.sh` | **Experimental, currently broken** (see [SGLang status](#sglang-status-broken-with-this-checkpoint)); requires `SGLANG_EXPERIMENTAL=1`. Launches the pinned SGLang container with DSpark speculative decoding (logs to `.sglang.log`, ID in `.sglang.pid`), waits for readiness, runs a generation smoke test. |
 | `stop.sh` | Stops whichever engine container is running, removes the pid files, and leaves the stopped container in place for `docker logs` post-mortem (the next start removes it). |
 | `bench.sh` | Benchmarks whatever is serving on the port using `vllm bench serve` in a throwaway client container, so it works against both engines. Fixed seeds for cross-config comparability; results in `.cache/huggingface/bench-results/<label>/`. `--full` adds the 128k long-context scenario. |
 
 Runtime artifacts (`.vllm.log`, `.sglang.log`, pid files, `.cache/`) are git-ignored.
 
-## Choosing an engine
+## SGLang status: broken with this checkpoint
 
-Measured on this box (details and methodology in [Benchmarks](#benchmarks)):
+**Use vLLM (`./start.sh`).** The SGLang path looked like the speed winner and is kept in the repo for retesting, but as of 2026-08-15 it produces broken output with the unsloth checkpoint and is gated behind `SGLANG_EXPERIMENTAL=1 ./start-sglang.sh`.
 
-| Workload | vLLM (`start.sh`) | SGLang (`start-sglang.sh`) |
-|---|---|---|
-| Thinking/code-heavy generation, 1 user | 28-31 tok/s | **~38-49 tok/s** (see note below) |
-| Plain prose, 1 user | 26.7 tok/s | 28.5 tok/s |
-| Random-content decode, 1 user | 27.5 tok/s | 26.1 tok/s |
-| Random-content decode, 4 users (aggregate) | 65.9 tok/s | **84.2 tok/s** |
-| Max context | 262k / **1M** (YaRN opt-in) | 262k |
-| Vision / video input | yes | untested here |
-| Reasoning parsing + tool calling | yes | yes |
-| `reasoning_effort` request control | yes | **none: always thinks at `xhigh`** (kwarg not passed to the template; `enable_thinking: false` works) |
+What happens: thinking-mode responses degrade into hard repetition loops on ordinary prompts (the trace repeats one sentence until the token limit), with visibly degraded fluency even before the loop starts. Reproduced on three different prompts with the model card's recommended sampling (temp 1.0 / top-p 0.95 / top-k 20), both with the shipped DSpark configuration and with strict rejection-sampling verification (`--speculative-use-rejection-sampling`), so the speculative decoding mode is not the cause. The isolation test without speculative decoding was cut short when the machine hard-froze from unified-memory pressure during SGLang startup, despite the container's `--memory 100g` caps (the caps don't fully account GPU/unified allocations on GB10).
 
-Rule of thumb: pick SGLang when you want raw decode speed, and vLLM when you need the features (1M-token context, vision input, `reasoning_effort` control) or the serving surface this repo has exercised much harder. The speed difference comes from speculative decoding: SGLang's DSpark drafts 7-token blocks with a dedicated 1.4B drafter that accepts extremely well on predictable reasoning and code text, while vLLM uses the checkpoint's built-in MTP head (5 tokens). Speculative decoding is lossless with respect to the target model in both engines, and both serve the same unsloth NVFP4 checkpoint (the DSpark drafter is a separate BF16 speculator, not a different quant of the main model).
+Leading suspect: SGLang's incomplete support for unsloth's compressed-tensors checkpoint, which mixes NVFP4 and FP8 quantization groups. At startup SGLang logs `Acceleration for non-quantized schemes is not supported by Compressed Tensors. Falling back to UnquantizedLinearMethod` and allocates a bf16 KV cache instead of the checkpoint's calibrated FP8 scheme — it is not running the quant path this checkpoint was built for. Supporting evidence: the same SGLang setup serving the RadixArk **modelopt**-format NVFP4 checkpoint (the combination the community actually validated) produced coherent, naturally-terminating output in our probes. If you want working SGLang serving of this model today, use that checkpoint via [hasso5703/dgx-spark-qwen38](https://github.com/hasso5703/dgx-spark-qwen38).
 
-Two caveats on the thinking-heavy row. First, tok/s is not time-to-answer: SGLang cannot lower the reasoning effort, so every thinking request pays an `xhigh`-length trace, while vLLM at `reasoning_effort: medium` or `low` generates far fewer tokens and can answer sooner despite a lower rate. (Workaround if you want SGLang with shorter thinking: pass a template with a different `reasoning_effort` default via `--chat-template`; the template supports it, only the per-request kwarg is broken.) Second, the measurement conditions were not fully matched; see the benchmark section.
+For the record, the speeds that made this path attractive: ~42-49 tok/s single-stream on thinking-heavy prompts (vs 28-31 for vLLM) and 84.2 tok/s aggregate at 4 streams (vs 65.9). **Treat the thinking-heavy numbers as invalid** — repetition loops draft near-perfectly in speculative decoding, so those measurements were partly clocking garbage. The 38.3/37.5 tok/s runs against the RadixArk checkpoint terminated naturally and remain the only trustworthy SGLang datapoints.
+
+Other SGLang limitations found during evaluation, for whenever the quality issue is fixed: context is capped at the native 262k (no validated YaRN-1M recipe), and the `reasoning_effort` template kwarg is not passed through, so every thinking request runs at `xhigh` (`enable_thinking: false` works; a patched `--chat-template` with a different default is the workaround).
 
 ## Configuration
 
@@ -97,9 +90,9 @@ Two caveats on the thinking-heavy row. First, tok/s is not time-to-answer: SGLan
 
 **Context length**: the model's native context is 262,144 tokens, served by default with no RoPE modification. `CONTEXT_1M=1 ./start.sh` applies the model card's static-YaRN recipe (factor 4.0) for 1M tokens; per the model card, static YaRN can slightly degrade short-context quality, which is why it is opt-in. Decode/prefill speed is the same either way. A single 1M-token sequence needs ~32 GB of KV; the pool covers ~8 concurrent 262k sequences or 2 × 1M.
 
-### SGLang (`start-sglang.sh`)
+### SGLang (`start-sglang.sh`, experimental)
 
-Serves the same checkpoint and model name on the same port. Key flags (community-validated GB10 setup from [hasso5703/dgx-spark-qwen38](https://github.com/hasso5703/dgx-spark-qwen38), reproduced here): `--mem-fraction-static 0.50`, `--attention-backend flashinfer`, `--speculative-algorithm DSPARK` with `RadixArk/Qwen3.8-27B-DSpark` (block size 7, drafter unquantized), `--enable-torch-compile`, `--num-continuous-decode-steps 2`, and hard `--memory 100g` caps so a runaway allocation cannot freeze the GB10's unified memory. First boot spends ~5-9 minutes in `torch.compile`; the cache under `.cache/sglang/` makes later boots faster. If you want a production SGLang deployment (systemd, API key, Anthropic-compatible endpoint, Claude Code integration), use the hasso5703 repo directly.
+Currently broken with this checkpoint; see [SGLang status](#sglang-status-broken-with-this-checkpoint). Kept for retesting after SGLang updates (`SGLANG_EXPERIMENTAL=1` to run). Serves the same checkpoint and model name on the same port. Key flags (from the community GB10 setup at [hasso5703/dgx-spark-qwen38](https://github.com/hasso5703/dgx-spark-qwen38)): `--mem-fraction-static 0.50`, `--attention-backend flashinfer`, `--speculative-algorithm DSPARK` with `RadixArk/Qwen3.8-27B-DSpark` (block size 7, drafter unquantized), `--enable-torch-compile`, `--num-continuous-decode-steps 2`, and hard `--memory 100g` caps that reduce, but on this box did not eliminate, the unified-memory freeze risk. First boot spends ~5-9 minutes in `torch.compile`; the cache under `.cache/sglang/` makes later boots faster.
 
 ## Using the API
 
@@ -147,17 +140,15 @@ Long context (single stream, 128k-token prompt, measured under the 1M-YaRN confi
 | Prefill throughput at 128k depth | ~555 tok/s | ~590 tok/s |
 | Decode at 128k context | 8.4 tok/s | **17.9 tok/s** |
 
-### Engine comparison (real workloads, single stream)
+### Real workloads (vLLM, single stream)
 
-| Prompt type | vLLM MTP k=5 | SGLang + DSpark |
-|---|---|---|
-| Code task (greedy, thinking) | 28.0 tok/s | **42.5 tok/s** |
-| Reasoning task (greedy, thinking) | 31.5 tok/s | **49.1 tok/s** |
-| Plain-prose continuation (template-free, greedy) | 26.7 tok/s | 28.5 tok/s |
+| Prompt type | vLLM MTP k=5 |
+|---|---|
+| Code task (greedy, thinking, terminated naturally at 726 tokens) | 28.0 tok/s |
+| Reasoning task (greedy, thinking, terminated naturally at 780 tokens) | 31.5 tok/s |
+| Plain-prose continuation (template-free, greedy, fixed 700 tokens) | 26.7 tok/s |
 
-Random-content comparison (same `bench.sh` scenarios): vLLM 27.5 tok/s c=1 / 65.9 c=4 vs SGLang 26.1 / 84.2.
-
-How matched are these? The prose row and the random benchmark are strict apples-to-apples: raw `/v1/completions` prompts (no chat template, no effort setting), identical inputs, fixed generation lengths on both engines. The code and reasoning rows both rendered the template's default `xhigh` effort, but the windows differ: vLLM's answers terminated naturally at 726-780 tokens while the SGLang runs hit the 1,500-token cap mid-thinking. Acceptance improves the deeper a thinking trace goes, so the longer window flatters SGLang; runs that terminated naturally (RadixArk-target checkpoint, same flags) measured 38.3/37.5 tok/s. Read the SGLang advantage on thinking content as roughly 38-49 tok/s against vLLM's 28-31, with the top of that range the optimistic end.
+SGLang measured faster on the same prompts (up to 49 tok/s), but its output turned out to be broken with this checkpoint and the thinking-heavy numbers were inflated by repetition loops, which draft near-perfectly. Details and the surviving trustworthy datapoints are in [SGLang status](#sglang-status-broken-with-this-checkpoint).
 
 ### Capacity (vLLM, from the engine startup log)
 
@@ -207,6 +198,8 @@ Worth re-evaluating the pin once these merge upstream: **#52244** (prefix-cache 
 - Download stalls: re-run `./download.sh`; it resumes.
 - Port already in use or won't start: `./stop.sh` (stops either engine), then start again.
 - Slow decode right after a vLLM start (about 16 tok/s single-stream): the launch lottery drew badly and the probe's one retry wasn't enough. Run `./stop.sh && ./start.sh` again.
+- Repeating, looping, or garbled responses: you are probably running the experimental SGLang engine; run `./stop.sh && ./start.sh` to get back on vLLM (see [SGLang status](#sglang-status-broken-with-this-checkpoint)).
+- Whole machine freezes or reboots during an SGLang start: known GB10 unified-memory failure mode; the container memory caps do not fully protect against it. Stick to vLLM.
 - Day-1 tokenizer bug: checkpoints downloaded before 2026-08-15 shipped a `tokenizer.json` that silently truncated every prompt to 2,048 tokens. Verify with `python3 -c "import json,glob; print(json.load(open(glob.glob('.cache/huggingface/hub/models--unsloth--Qwen3.8-27B-NVFP4/snapshots/*/tokenizer.json')[0]))['truncation'])"`; it must print `None`. Otherwise re-run `./download.sh`.
 
 ## Repository layout

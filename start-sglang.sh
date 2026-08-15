@@ -5,20 +5,26 @@ set -euo pipefail
 # (DGX Spark / GB10, aarch64). Alternative engine to start.sh — same model,
 # same port, same served-model name, so clients don't care which one runs.
 #
-# Why this exists (measured on this box, see README "Choosing an engine"):
-#   - Thinking-heavy generation (reasoning traces, code): ~38-49 tok/s
-#     single-stream vs ~28-31 on the vLLM setup. DSpark drafts 7-token
-#     blocks with a separate 1.4B drafter that accepts extremely well on
-#     predictable reasoning text. Note: requests always think at xhigh
-#     effort here (see limitations), so time-to-answer can still favor
-#     vLLM at a lower reasoning_effort.
-#   - Plain prose: ~28.5 tok/s vs vLLM's ~26.7 (roughly a tie).
-#   - Random-content decode: c=1 roughly a tie, c=4 aggregate 84.2 vs
-#     65.9 tok/s in SGLang's favor.
+# ############################ EXPERIMENTAL ################################
+# STATUS 2026-08-15: BROKEN with this checkpoint. Thinking-mode output
+# degrades into hard repetition loops on ordinary prompts, even with the
+# model card's recommended sampling (temp 1.0 / top_p 0.95 / top_k 20), and
+# both with and without strict rejection-sampling verification. Suspected
+# cause: SGLang's partial support for unsloth's compressed-tensors mixed
+# NVFP4/FP8 scheme (startup logs "Falling back to UnquantizedLinearMethod"
+# and allocates a bf16 KV cache instead of the checkpoint's calibrated FP8
+# scheme). The community-validated SGLang path uses the RadixArk modelopt
+# checkpoint instead (see hasso5703/dgx-spark-qwen38). During further
+# isolation testing the machine hard-froze from unified-memory pressure
+# despite the --memory caps below. Full details in the README's "SGLang
+# status" section. Requires SGLANG_EXPERIMENTAL=1 to run.
+# ##########################################################################
 #
-# The target checkpoint is unsloth's NVFP4 (same as start.sh). The drafter,
-# RadixArk/Qwen3.8-27B-DSpark, is a separate unquantized BF16 speculator —
-# speculative decoding is lossless w.r.t. the target model by construction.
+# What made this path interesting: it measured ~38-49 tok/s single-stream on
+# thinking-heavy content vs ~28-31 for vLLM, and 84.2 tok/s aggregate at 4
+# streams vs 65.9 — but the thinking-heavy numbers are contaminated by the
+# repetition loops (loops draft near-perfectly), so treat them as invalid
+# until the output quality is fixed.
 #
 # Known limitations vs start.sh (details in README):
 #   - Context is the native 262,144 tokens; no validated YaRN-1M recipe.
@@ -26,14 +32,31 @@ set -euo pipefail
 #     unsloth's chat template, so requests think at the model's default
 #     (xhigh) effort; `chat_template_kwargs: {"enable_thinking": false}`
 #     works to disable thinking entirely.
-#   - No MTP health probe needed: the vLLM launch lottery is vLLM-specific.
 #
-# Flags follow the community-validated GB10 setup (hasso5703/dgx-spark-qwen38);
-# the hard --memory caps protect the GB10's unified memory from a hard freeze.
+# Flags follow the community GB10 setup (hasso5703/dgx-spark-qwen38); the
+# hard --memory caps reduce (but on this box did not eliminate) the risk of
+# a unified-memory hard freeze.
 
 # Anchor all paths to the repo dir regardless of the caller's cwd (matches
 # download.sh/bench.sh, and keeps .cache/ + log/pid files in one place).
 cd "$(dirname "$0")"
+
+if [[ "${SGLANG_EXPERIMENTAL:-0}" != "1" ]]; then
+  cat <<'MSG'
+start-sglang.sh is currently EXPERIMENTAL AND BROKEN with this checkpoint:
+thinking-mode output degrades into repetition loops (even at the recommended
+sampling settings), and a test run hard-froze this machine from unified-memory
+pressure. See the "SGLang status" section of the README for the full story.
+
+If you want to run it anyway (e.g. to retest after an SGLang update):
+
+    SGLANG_EXPERIMENTAL=1 ./start-sglang.sh
+
+For working SGLang serving of this model today, use the RadixArk modelopt
+checkpoint via https://github.com/hasso5703/dgx-spark-qwen38 instead.
+MSG
+  exit 1
+fi
 
 MODEL_ID="unsloth/Qwen3.8-27B-NVFP4"
 DRAFT_ID="RadixArk/Qwen3.8-27B-DSpark"
