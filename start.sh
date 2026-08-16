@@ -69,14 +69,36 @@ case "${VARIANT}" in
   mtp)
     MODEL_ID="unsloth/Qwen3.8-27B-NVFP4"
     SERVED_MODEL_NAME="qwen38-27b-unsloth-nvfp4"
+    QUANT_ARGS=(--quantization compressed-tensors)
     SPEC_CONFIG='{"method": "mtp", "num_speculative_tokens": 5}'
     # c*(1+k) for c=1..8 at k=5 (see ladder note above)
     LADDER=(1 2 4 6 8 12 16 18 24 30 36 42 48)
     PROBE_MIN="0.55"
     ;;
   dspark)
-    MODEL_ID="RadixArk/Qwen3.8-27B-NVFP4"
-    SERVED_MODEL_NAME="qwen38-27b-radixark-nvfp4"
+    # DSPARK_TARGET=radixark (default): fastest measured config overall.
+    # DSPARK_TARGET=unsloth: same drafter over the unsloth checkpoint —
+    # works, and still beats MTP on real content (39.1/34.6/30.9 tok/s),
+    # but 10-30% behind the RadixArk target everywhere: the
+    # compressed-tensors kernel path is ~12ms/step slower than modelopt,
+    # and draft acceptance is lower against this target.
+    case "${DSPARK_TARGET:-radixark}" in
+      radixark)
+        MODEL_ID="RadixArk/Qwen3.8-27B-NVFP4"
+        SERVED_MODEL_NAME="qwen38-27b-radixark-nvfp4"
+        # The checkpoint's hf_quant_config.json (modelopt) is auto-detected.
+        QUANT_ARGS=()
+        ;;
+      unsloth)
+        MODEL_ID="unsloth/Qwen3.8-27B-NVFP4"
+        SERVED_MODEL_NAME="qwen38-27b-unsloth-nvfp4"
+        QUANT_ARGS=(--quantization compressed-tensors)
+        ;;
+      *)
+        echo "Unknown DSPARK_TARGET '${DSPARK_TARGET}' (expected 'radixark' or 'unsloth')"
+        exit 1
+        ;;
+    esac
     SPEC_CONFIG='{"method": "dspark", "model": "/root/.cache/huggingface/'"${DRAFT_LOCAL_DIR_NAME}"'", "num_speculative_tokens": 7, "draft_sample_method": "probabilistic"}'
     # c*(1+k) for c=1..8 at k=7
     LADDER=(1 2 4 8 16 24 32 40 48 56 64)
@@ -236,7 +258,7 @@ docker run -d \
   --port "${PORT}" \
   --tensor-parallel-size 1 \
   --trust-remote-code \
-  --quantization compressed-tensors \
+  "${QUANT_ARGS[@]}" \
   --attention-backend triton_attn \
   --kv-cache-dtype fp8 \
   --gpu-memory-utilization 0.84 \

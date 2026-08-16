@@ -69,6 +69,21 @@ vLLM ships a native DSpark implementation (`VARIANT=dspark ./start.sh`). Three t
 - `"draft_sample_method": "probabilistic"` in the speculative config is worth ~23% over the default greedy drafting.
 - Keep `num_speculative_tokens: 7`: smaller blocks bench worse (per-step overhead dominates), and `enable_adaptive_verification` is rejected by the GDN attention backend, so the drafter's confidence head is unused under vLLM.
 
+The drafter is target-agnostic, so the dspark variant can also serve the unsloth checkpoint: `VARIANT=dspark DSPARK_TARGET=unsloth ./start.sh`. Measured: 39.1 / 34.6 / 30.9 tok/s on the real code/reasoning/math prompts and 16.3 c=1 / 50.8 c=4 on random content — still ahead of MTP on real content, but 10-30% behind the RadixArk target everywhere, for two stacking reasons: vLLM's compressed-tensors kernel path runs ~12ms/step slower than the modelopt path (the same gap shows in prefill, 1,339 vs 1,827 tok/s), and draft acceptance is lower against this target (the drafter was trained on FP8-checkpoint hidden states, which the modelopt quant apparently tracks more closely).
+
+### Quant quality: unsloth vs RadixArk
+
+The two checkpoints are structurally similar mixed-precision quants, not different classes: both keep all attention and linear-attention projections at FP8 (e4m3) and quantize the MLPs to NVFP4 with calibrated scales, and both leave the vision tower unquantized. unsloth is more conservative in two places — the last 8 MLP layers stay at FP8, and the FP8 KV cache ships calibrated scales (RadixArk's KV runs with 1.0 defaults and says so in its own qualification file). RadixArk ships a documented qualification: 97.27% on the full 1,319-example GSM8K, gated at a 96.5% minimum, converted directly from `Qwen/Qwen3.8-27B`.
+
+Measured head-to-head on this box (2026-08-16, same vLLM engine, greedy):
+
+| | unsloth | RadixArk |
+|---|---|---|
+| Perplexity, 29,598 tokens of novel prose | 3.1952 | 3.1826 |
+| GSM8K, 120-item subset (thinking, medium effort) | 96.7-97.5%* | 97.5% |
+
+*Run-to-run spread from batching nondeterminism is ±1 item, so all of these are statistically indistinguishable: **no measurable quality gap on these signals**. Scope honestly: two signals (English prose likelihood, grade-school math) — coding, long-context (where the uncalibrated KV scales could in principle matter), multilingual, and vision quality were not compared.
+
 Verification differs between engines: vLLM uses lossless rejection sampling (output distribution provably matches the target model); SGLang's default is threshold-based acceptance, which is looser. Quality checks on this box (2026-08-16) were clean for both: 60+ battery runs across looping-prone prompts, code, and exact-answer questions, at recommended sampling and greedy, with zero repetition loops, zero non-terminating responses, and correct answers throughout.
 
 ## SGLang status
