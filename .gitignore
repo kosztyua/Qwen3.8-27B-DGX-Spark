@@ -6,3 +6,4 @@
 .sglang.pid
 .memguard.log
 .memguard.pid
+*.swp
