@@ -26,7 +26,6 @@ set -uo pipefail
 
 # Keep in sync with IMAGE in start.sh (the client just needs `vllm bench`).
 CLIENT_IMAGE="vllm/vllm-openai@sha256:b5c860acda75d737a8e58cc99ba86ff13982695dceae194f906c2d7b54979358"
-TOKENIZER="unsloth/Qwen3.8-27B-NVFP4"
 
 LABEL="${1:?usage: bench.sh <label> [--full] [--scenarios dec1,dec4,...] [--port N] [--model NAME]}"
 shift
@@ -56,12 +55,16 @@ if ! curl -fsS -m 5 "http://127.0.0.1:${PORT}/v1/models" >/dev/null 2>&1; then
   exit 1
 fi
 
-# The two engines serve different model names; ask the server which it is.
+# Variants serve different model names; ask the server which it is.
 if [[ -z "${MODEL}" ]]; then
   MODEL=$(curl -fsS -m 5 "http://127.0.0.1:${PORT}/v1/models" \
     | python3 -c "import json,sys; print(json.load(sys.stdin)['data'][0]['id'])")
   [[ -n "${MODEL}" ]] || { echo "Could not detect the served model name; pass --model"; exit 1; }
 fi
+case "${MODEL}" in
+  *radixark*) TOKENIZER="RadixArk/Qwen3.8-27B-NVFP4" ;;
+  *)          TOKENIZER="unsloth/Qwen3.8-27B-NVFP4" ;;
+esac
 
 failures=0
 run_scenario() {

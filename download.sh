@@ -1,15 +1,23 @@
 #!/usr/bin/env bash
-# Pre-download unsloth/Qwen3.8-27B-NVFP4 into this dir's HF cache, with retries.
-# With --sglang, also fetch the DSpark drafter used by start-sglang.sh.
+# Pre-download the checkpoints into this dir's HF cache, with retries.
+#
+#   ./download.sh          RadixArk target + DSpark drafter (what the default
+#                          ./start.sh and ./start-sglang.sh serve)
+#   ./download.sh --mtp    unsloth checkpoint (for VARIANT=mtp / DSPARK_TARGET=unsloth)
+#   ./download.sh --all    everything
+#
 # HF_TOKEN is set (without export) in ~/.bashrc -> pick it up here.
 set -u
 cd "$(dirname "$0")"
 
-REPOS=("unsloth/Qwen3.8-27B-NVFP4")
-if [[ "${1:-}" == "--sglang" ]]; then
-  # SGLang serves the RadixArk modelopt checkpoint plus the DSpark drafter.
-  REPOS+=("RadixArk/Qwen3.8-27B-NVFP4" "RadixArk/Qwen3.8-27B-DSpark")
-fi
+DEFAULT_REPOS=("RadixArk/Qwen3.8-27B-NVFP4" "RadixArk/Qwen3.8-27B-DSpark")
+MTP_REPOS=("unsloth/Qwen3.8-27B-NVFP4")
+case "${1:-}" in
+  "" | --sglang) REPOS=("${DEFAULT_REPOS[@]}") ;;
+  --mtp)         REPOS=("${MTP_REPOS[@]}") ;;
+  --all)         REPOS=("${DEFAULT_REPOS[@]}" "${MTP_REPOS[@]}") ;;
+  *) echo "usage: download.sh [--mtp|--all]"; exit 1 ;;
+esac
 
 # Honor an HF_TOKEN already in the environment; fall back to ~/.bashrc
 # (mirrors the start scripts).

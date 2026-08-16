@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# unsloth/Qwen3.8-27B-NVFP4 on vLLM (DGX Spark / GB10, aarch64)
+# Qwen3.8-27B on vLLM (DGX Spark / GB10, aarch64)
 #
-# NVFP4-specific notes:
-#   - Checkpoint is compressed-tensors format (dynamic NVFP4: mixed 4-bit
-#     weights/activations with 8-bit groups for sensitive modules), so we pass
-#     --quantization compressed-tensors like the Qwen3.6-27B-NVFP4 setup.
+# Serves one of two NVFP4 checkpoints of the same base model, selected by
+# VARIANT (see the case block below). The default is the fastest measured
+# config on this box: RadixArk/Qwen3.8-27B-NVFP4 with DSpark speculative
+# decoding.
+#
+# Notes that apply to every variant:
 #   - IMAGE IS PINNED BY DIGEST (v0.27.2rc1.dev110+gacb0f1dcd, the 2026-08-15
-#     nightly). Reasons: (a) stable 0.27.1 cannot load this checkpoint
+#     nightly). Reasons: (a) stable 0.27.1 cannot load this model family
 #     ("MergedColumnParallelLinear has no attribute data"); (b) this nightly
 #     contains the SM12x FlashInfer XQA decode path (PR #49718) and the fused
 #     GDN MTP decode kernel (PR #51674), and an open revert (PR #51987) may
@@ -16,34 +18,28 @@ set -euo pipefail
 #     #52244 (GDN prefix-cache hits under MTP), #52000 (uniform-decode graph
 #     dispatch), #52013 (dedicated MTP draft lm_head), #50862 (FlashInfer GDN
 #     prefill on SM12x), #51954 (GDN decode gate copies).
-#   - Speculative decoding: unsloth ships MTP weights (model_mtp.safetensors).
-#     num_speculative_tokens=5 measured fastest single-stream on this box
-#     (27.5 tok/s vs 23.8 at k=2; c=4 aggregate dips ~7%). AVOID k=3: this
-#     build mis-drafts in the 4-token decode path (c=1, k=3) and single-stream
-#     collapses to ~15 tok/s.
 #   - --cudagraph-capture-sizes must contain c*(1+k) for c=1..max-num-seqs or
-#     decode batches run attention eagerly (PR #52000): for k=5 and
-#     max-num-seqs 8 that is 6/12/18/24/30/36/42/48 (all in the ladder
-#     below). Aggregate decode scales well past 4 concurrent streams
-#     (measured: 65.9 tok/s at c=4, 98.6 at c=6, 106.3 at c=8).
-#   - The checkpoint carries a calibrated FP8 kv_cache_scheme (static
-#     per-tensor scales, 2x KV memory savings). We pass --kv-cache-dtype fp8
-#     explicitly (matches vLLM's official recipe; "auto" resolves to the same
-#     today, the flag guards against a silent bf16 fallback on image bumps).
+#     decode batches run attention eagerly (PR #52000); each variant sets its
+#     own ladder for its k.
+#   - --kv-cache-dtype fp8 halves KV memory vs bf16. The unsloth checkpoint
+#     ships calibrated KV scales; RadixArk's uses 1.0 defaults (measured
+#     quality was indistinguishable at short/medium context, see README).
 #   - Dense model (SwiGLU gate/up/down_proj, no experts) -> no --moe-backend.
+#   - MTP-variant-only bug in this build: num_speculative_tokens=3 mis-drafts
+#     in the 4-token decode path and single-stream collapses; k=5 is the
+#     measured optimum for MTP.
 #
-# The repo ships its own chat_template.jinja; thinking mode and
-# preserve_thinking are ON by default (disable per request via
-# chat_template_kwargs {"enable_thinking": false}). The model defaults to
-# reasoning_effort "xhigh"; for shorter thinking traces add e.g.
-#   --default-chat-template-kwargs '{"reasoning_effort": "medium"}'
+# Chat template: thinking mode and preserve_thinking are ON by default
+# (disable per request via chat_template_kwargs {"enable_thinking": false}).
+# The model defaults to reasoning_effort "xhigh"; for shorter thinking traces
+# add e.g. --default-chat-template-kwargs '{"reasoning_effort": "medium"}'
 #
 # Default sampling params (thinking mode, per model card):
 #   temperature=1.0, top_p=0.95, top_k=20, min_p=0.0,
 #   presence_penalty=0.0, repetition_penalty=1.0
-# temp/top_p/top_k come from the repo's generation_config.json (vLLM default
-# --generation-config auto); min_p/presence_penalty/repetition_penalty are
-# vLLM's own defaults. For instruct / non-thinking requests, clients should
+# temp/top_p/top_k come from the checkpoint's generation_config.json (vLLM
+# default --generation-config auto); min_p/presence_penalty/repetition_penalty
+# are vLLM's own defaults. For instruct / non-thinking requests, clients should
 # override per request: temperature=0.7, top_p=0.8, top_k=20, presence_penalty=1.5
 
 # Anchor all paths to the repo dir regardless of the caller's cwd (matches
@@ -51,18 +47,20 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 # Speculative-decoding variant.
-#   VARIANT=mtp (default): unsloth checkpoint + its built-in MTP head (k=5).
-#     Best on unpredictable/batched content (27.5 tok/s c=1 random, 106 tok/s
-#     c=8 aggregate), full feature set including CONTEXT_1M.
-#   VARIANT=dspark: RadixArk modelopt checkpoint + the 1.4B DSpark block
-#     drafter (k=7, probabilistic draft sampling — greedy drafting measures
-#     ~23% slower). Much faster on real reasoning/code content: 38-43 tok/s
-#     single-stream vs 28-31 for MTP. Slower on random content (~21 tok/s),
-#     smaller KV pool (~1.4M tokens), 262k context only.
+#   VARIANT=dspark (default): RadixArk modelopt checkpoint + the 1.4B DSpark
+#     block drafter (k=7, probabilistic draft sampling — greedy drafting
+#     measures ~23% slower). Fastest measured config: 38-43 tok/s
+#     single-stream on real reasoning/code content, 122.8 tok/s aggregate at
+#     8 streams. 262k context, ~1.4M-token KV pool.
+#     DSPARK_TARGET=unsloth swaps in the unsloth checkpoint (works, ~10-30%
+#     slower; see README).
+#   VARIANT=mtp: unsloth checkpoint + its built-in MTP head (k=5). Best on
+#     unpredictable single-stream content (27.5 tok/s random c=1) and the
+#     only variant with the CONTEXT_1M option and vision validation.
 # The dspark drafter config needs its architectures field patched from
 # DSparkDraftModel (which vLLM's registry routes to a DeepSeek-V4 class) to
 # Qwen3DSparkModel; this script maintains a patched local copy automatically.
-VARIANT="${VARIANT:-mtp}"
+VARIANT="${VARIANT:-dspark}"
 DRAFT_ID="RadixArk/Qwen3.8-27B-DSpark"
 DRAFT_LOCAL_DIR_NAME="dspark-qwen38-local"
 case "${VARIANT}" in
