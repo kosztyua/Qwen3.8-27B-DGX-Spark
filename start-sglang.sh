@@ -186,6 +186,15 @@ container_id="$(docker inspect -f '{{.Id}}' "${CONTAINER_NAME}")"
 echo "${container_id}" > "${PID_FILE}"
 echo "Spawned container ${CONTAINER_NAME} (${container_id})"
 
+# Runtime memory guard: kills the container before unified-memory pressure
+# can freeze the host (see memguard.sh). stop.sh cleans it up.
+if [[ -f .memguard.pid ]] && kill -0 "$(cat .memguard.pid)" 2>/dev/null; then
+  kill "$(cat .memguard.pid)" 2>/dev/null || true
+fi
+nohup ./memguard.sh "${CONTAINER_NAME}" >/dev/null 2>&1 &
+echo $! > .memguard.pid
+echo "Runtime memory guard active (memguard.sh, log: .memguard.log)"
+
 log_follow_pid=""
 cleanup() {
   if [[ -n "${log_follow_pid}" ]] && kill -0 "${log_follow_pid}" 2>/dev/null; then

@@ -51,9 +51,10 @@ The start scripts are idempotent: if their container is already running they say
 | Script | What it does |
 |---|---|
 | `download.sh` | Pre-downloads `unsloth/Qwen3.8-27B-NVFP4` (and with `--sglang` the `RadixArk/Qwen3.8-27B-DSpark` drafter) into `./.cache/huggingface`, with up to 10 attempts per repo (plain HTTP, xet disabled, so stalled downloads resume cleanly). |
-| `start.sh` | Launches the pinned vLLM container (`docker run -d`, host network), streams logs to `.vllm.log`, records the container ID in `.vllm.pid`, waits for readiness, then runs a speculative-decode health probe (see [Known issues](#tuning-notes--known-issues)). `CONTEXT_1M=1 ./start.sh` serves the 1M-token YaRN context. |
+| `start.sh` | Launches the pinned vLLM container (`docker run -d`, host network), streams logs to `.vllm.log`, records the container ID in `.vllm.pid`, waits for readiness, then runs a speculative-decode health probe (see [Known issues](#tuning-notes--known-issues)). Refuses to boot until 100 GiB of memory is actually free, and starts the runtime memory guard. `CONTEXT_1M=1 ./start.sh` serves the 1M-token YaRN context. |
 | `start-sglang.sh` | Launches the pinned SGLang container serving the RadixArk checkpoint with DSpark speculative decoding (logs to `.sglang.log`, ID in `.sglang.pid`), with a memory pre-flight that refuses to boot until the other engine's memory is released. Waits for readiness, runs a generation smoke test. `SGLANG_TARGET=unsloth` (broken, needs `SGLANG_EXPERIMENTAL=1`) exists for retesting; see [SGLang status](#sglang-status). |
-| `stop.sh` | Stops whichever engine container is running, removes the pid files, and leaves the stopped container in place for `docker logs` post-mortem (the next start removes it). |
+| `stop.sh` | Stops whichever engine container is running (and the memory guard), removes the pid files, and leaves the stopped container in place for `docker logs` post-mortem (the next start removes it). |
+| `memguard.sh` | Runtime memory guard, started automatically by both start scripts. Watches `MemAvailable` every 2 s and force-removes the engine container if it stays under 4 GiB — on the GB10 a memory spiral otherwise freezes the whole machine, and container `--memory` caps don't cover GPU/unified allocations. Actions are logged to `.memguard.log`. |
 | `bench.sh` | Benchmarks whatever is serving on the port using `vllm bench serve` in a throwaway client container, so it works against both engines. Fixed seeds for cross-config comparability; results in `.cache/huggingface/bench-results/<label>/`. `--full` adds the 128k long-context scenario. |
 
 Runtime artifacts (`.vllm.log`, `.sglang.log`, pid files, `.cache/`) are git-ignored.
@@ -68,7 +69,7 @@ Trade-offs vs the vLLM setup:
 
 - It is a different quantization of the same base model, from NVIDIA's modelopt toolchain rather than unsloth's calibration pipeline. Quality differences between the two quants have not been evaluated head-to-head here.
 - Context is the native 262k (no validated YaRN-1M recipe), and the `reasoning_effort` template kwarg is not passed through, so every thinking request runs at `xhigh` (`enable_thinking: false` works; a patched `--chat-template` with a different default is the workaround). Vision input is untested.
-- Startup can pressure the GB10's unified memory (one hard freeze observed on this box during a cold boot; the container `--memory` caps don't fully account GPU allocations). The script now refuses to boot until at least 100 GiB is actually free, which prevents the dangerous case of booting while the other engine still holds its memory.
+- Startup can pressure the GB10's unified memory (one hard freeze observed on this box during a cold boot; the container `--memory` caps don't fully account GPU allocations). Two safeguards now cover this, for both engines: the start scripts refuse to boot until at least 100 GiB is actually free (the freeze case was booting while the other engine still held its memory), and `memguard.sh` watches `MemAvailable` at runtime and kills the engine container before the host starves.
 
 **The unsloth checkpoint remains broken under SGLang** (`SGLANG_TARGET=unsloth`, additionally gated behind `SGLANG_EXPERIMENTAL=1` for retesting after SGLang updates). Thinking-mode output degrades into hard repetition loops on ordinary prompts, with degraded fluency before the loop, at recommended sampling, and identically with strict rejection-sampling verification, so the speculative-decoding mode is not the cause. Leading suspect: SGLang's incomplete support for unsloth's compressed-tensors format, which mixes NVFP4 and FP8 quantization groups; at startup it logs `Falling back to UnquantizedLinearMethod` and allocates a bf16 KV cache instead of the checkpoint's calibrated FP8 scheme. The loop-contaminated speed numbers previously measured on that path (42-49 tok/s) are invalid: loops draft near-perfectly in speculative decoding.
 
@@ -201,7 +202,8 @@ Worth re-evaluating the pin once these merge upstream: **#52244** (prefix-cache 
 - Port already in use or won't start: `./stop.sh` (stops either engine), then start again.
 - Slow decode right after a vLLM start (about 16 tok/s single-stream): the launch lottery drew badly and the probe's one retry wasn't enough. Run `./stop.sh && ./start.sh` again.
 - Repeating, looping, or garbled responses: you are probably running SGLang with the broken unsloth target (`SGLANG_TARGET=unsloth`); use the default RadixArk target or `./stop.sh && ./start.sh` for vLLM (see [SGLang status](#sglang-status)).
-- Whole machine freezes or reboots during an SGLang start: known GB10 unified-memory failure mode; the container memory caps do not fully protect against it. Stick to vLLM.
+- The server vanished while running: check `.memguard.log` — the memory guard force-removes the engine container when available memory stays under 4 GiB, because on the GB10 the alternative is the whole machine freezing. Find what ate the memory, then restart with the matching start script.
+- Whole machine freezes or reboots around an engine start: the GB10 unified-memory failure mode. The start scripts' 100 GiB pre-flight and `memguard.sh` exist to prevent it; if it still happens, check whether something outside the repo's containers was holding memory.
 - Day-1 tokenizer bug: checkpoints downloaded before 2026-08-15 shipped a `tokenizer.json` that silently truncated every prompt to 2,048 tokens. Verify with `python3 -c "import json,glob; print(json.load(open(glob.glob('.cache/huggingface/hub/models--unsloth--Qwen3.8-27B-NVFP4/snapshots/*/tokenizer.json')[0]))['truncation'])"`; it must print `None`. Otherwise re-run `./download.sh`.
 
 ## Repository layout
@@ -212,6 +214,7 @@ Worth re-evaluating the pin once these merge upstream: **#52244** (prefix-cache 
 ├── start.sh          # serve with vLLM (default engine)
 ├── start-sglang.sh   # serve with SGLang + DSpark (alternative engine)
 ├── stop.sh           # stop whichever engine is running
+├── memguard.sh       # runtime memory guard (started by the start scripts)
 ├── bench.sh          # benchmark whatever is serving (works with both engines)
 ├── .gitignore        # excludes .cache/, logs, pid files
 ├── LICENSE

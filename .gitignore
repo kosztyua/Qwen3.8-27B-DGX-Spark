@@ -4,3 +4,5 @@
 .vllm.pid
 .sglang.log
 .sglang.pid
+.memguard.log
+.memguard.pid

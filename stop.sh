@@ -33,6 +33,13 @@ stop_one() {
 stop_one "qwen3.8-27b-nvfp4" ".vllm.pid" ".vllm.log"
 stop_one "qwen3.8-27b-sglang" ".sglang.pid" ".sglang.log"
 
+# Stop the runtime memory guard (it also exits by itself once its container
+# is gone, but clean up proactively).
+if [[ -f .memguard.pid ]]; then
+  kill "$(cat .memguard.pid)" 2>/dev/null || true
+  rm -f .memguard.pid
+fi
+
 if [[ "${stopped}" == "0" ]]; then
   echo "No engine container is running; nothing to stop"
 fi

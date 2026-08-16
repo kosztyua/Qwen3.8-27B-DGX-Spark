@@ -115,6 +115,23 @@ if docker ps -a --format '{{.Names}}' | grep -qxF "${CONTAINER_NAME}"; then
   docker rm "${CONTAINER_NAME}" >/dev/null
 fi
 
+# Memory pre-flight. vLLM reserves ~102 GiB of the GB10's unified memory;
+# booting while the previous engine's memory is still being released can
+# starve the host into a hard freeze (container --memory caps don't cover
+# GPU/unified allocations). Wait until the memory is actually free.
+echo "Waiting for >= 100 GiB of available memory before booting..."
+for i in $(seq 1 24); do
+  mem_avail=$(awk '/MemAvailable/{print int($2/1048576)}' /proc/meminfo)
+  if [ "${mem_avail}" -ge 100 ]; then break; fi
+  sleep 5
+done
+if [ "${mem_avail}" -lt 100 ]; then
+  echo "Only ${mem_avail} GiB available after 2 minutes — refusing to boot to protect the host."
+  echo "Stop whatever is using the memory (./stop.sh for the other engine) and retry."
+  exit 1
+fi
+echo "OK: ${mem_avail} GiB available"
+
 echo "Starting vLLM container for ${MODEL_ID} (NVFP4, MTP speculative decoding)"
 echo "Image: ${IMAGE}"
 echo "Served model name: ${SERVED_MODEL_NAME}"
@@ -175,6 +192,15 @@ docker run -d \
 container_id="$(docker inspect -f '{{.Id}}' "${CONTAINER_NAME}")"
 echo "${container_id}" > "${PID_FILE}"
 echo "Spawned container ${CONTAINER_NAME} (${container_id})"
+
+# Runtime memory guard: kills the container before unified-memory pressure
+# can freeze the host (see memguard.sh). stop.sh cleans it up.
+if [[ -f .memguard.pid ]] && kill -0 "$(cat .memguard.pid)" 2>/dev/null; then
+  kill "$(cat .memguard.pid)" 2>/dev/null || true
+fi
+nohup ./memguard.sh "${CONTAINER_NAME}" >/dev/null 2>&1 &
+echo $! > .memguard.pid
+echo "Runtime memory guard active (memguard.sh, log: .memguard.log)"
 
 log_follow_pid=""
 cleanup() {
