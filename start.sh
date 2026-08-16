@@ -50,8 +50,44 @@ set -euo pipefail
 # download.sh/bench.sh, and keeps .cache/ + log/pid files in one place).
 cd "$(dirname "$0")"
 
-MODEL_ID="unsloth/Qwen3.8-27B-NVFP4"
-SERVED_MODEL_NAME="qwen38-27b-unsloth-nvfp4"
+# Speculative-decoding variant.
+#   VARIANT=mtp (default): unsloth checkpoint + its built-in MTP head (k=5).
+#     Best on unpredictable/batched content (27.5 tok/s c=1 random, 106 tok/s
+#     c=8 aggregate), full feature set including CONTEXT_1M.
+#   VARIANT=dspark: RadixArk modelopt checkpoint + the 1.4B DSpark block
+#     drafter (k=7, probabilistic draft sampling — greedy drafting measures
+#     ~23% slower). Much faster on real reasoning/code content: 38-43 tok/s
+#     single-stream vs 28-31 for MTP. Slower on random content (~21 tok/s),
+#     smaller KV pool (~1.4M tokens), 262k context only.
+# The dspark drafter config needs its architectures field patched from
+# DSparkDraftModel (which vLLM's registry routes to a DeepSeek-V4 class) to
+# Qwen3DSparkModel; this script maintains a patched local copy automatically.
+VARIANT="${VARIANT:-mtp}"
+DRAFT_ID="RadixArk/Qwen3.8-27B-DSpark"
+DRAFT_LOCAL_DIR_NAME="dspark-qwen38-local"
+case "${VARIANT}" in
+  mtp)
+    MODEL_ID="unsloth/Qwen3.8-27B-NVFP4"
+    SERVED_MODEL_NAME="qwen38-27b-unsloth-nvfp4"
+    SPEC_CONFIG='{"method": "mtp", "num_speculative_tokens": 5}'
+    # c*(1+k) for c=1..8 at k=5 (see ladder note above)
+    LADDER=(1 2 4 6 8 12 16 18 24 30 36 42 48)
+    PROBE_MIN="0.55"
+    ;;
+  dspark)
+    MODEL_ID="RadixArk/Qwen3.8-27B-NVFP4"
+    SERVED_MODEL_NAME="qwen38-27b-radixark-nvfp4"
+    SPEC_CONFIG='{"method": "dspark", "model": "/root/.cache/huggingface/'"${DRAFT_LOCAL_DIR_NAME}"'", "num_speculative_tokens": 7, "draft_sample_method": "probabilistic"}'
+    # c*(1+k) for c=1..8 at k=7
+    LADDER=(1 2 4 8 16 24 32 40 48 56 64)
+    # DSpark position-0 acceptance is legitimately lower than MTP's
+    PROBE_MIN="0.25"
+    ;;
+  *)
+    echo "Unknown VARIANT '${VARIANT}' (expected 'mtp' or 'dspark')"
+    exit 1
+    ;;
+esac
 # Pinned: vllm/vllm-openai:nightly-aarch64 as of 2026-08-15 (see header notes)
 IMAGE="vllm/vllm-openai@sha256:b5c860acda75d737a8e58cc99ba86ff13982695dceae194f906c2d7b54979358"
 CONTAINER_NAME="qwen3.8-27b-nvfp4"
@@ -76,6 +112,10 @@ READY_URL="http://127.0.0.1:${PORT}/v1/models"
 # concurrent 262k sequences or 2 x 1M.
 CONTEXT_ARGS=(--max-model-len 262144)
 if [[ "${CONTEXT_1M:-0}" == "1" ]]; then
+  if [[ "${VARIANT}" == "dspark" ]]; then
+    echo "CONTEXT_1M=1 is only validated with VARIANT=mtp (the YaRN recipe is untested on the RadixArk checkpoint)."
+    exit 1
+  fi
   CONTEXT_ARGS=(
     --max-model-len 1000000
     --hf-overrides '{"text_config": {"rope_parameters": {"mrope_interleaved": true, "mrope_section": [11, 11, 10], "rope_type": "yarn", "rope_theta": 10000000, "partial_rotary_factor": 0.25, "factor": 4.0, "original_max_position_embeddings": 262144}}}'
@@ -133,7 +173,31 @@ if [ "${mem_avail}" -lt 100 ]; then
 fi
 echo "OK: ${mem_avail} GiB available"
 
-echo "Starting vLLM container for ${MODEL_ID} (NVFP4, MTP speculative decoding)"
+# VARIANT=dspark: make sure the target checkpoint and the drafter are cached,
+# and maintain the patched local drafter copy (architectures field fix).
+if [[ "${VARIANT}" == "dspark" ]]; then
+  for repo in "${MODEL_ID}" "${DRAFT_ID}"; do
+    cache_dir="${HF_HOME}/hub/models--${repo//\//--}"
+    if ! ls "${cache_dir}"/snapshots/*/*.safetensors >/dev/null 2>&1; then
+      echo "${repo} not in cache — downloading"
+      docker run --rm --network host \
+        -e HF_HOME=/root/.cache/huggingface -e HF_TOKEN="${HF_TOKEN:-}" \
+        -v "${HF_HOME}:/root/.cache/huggingface" \
+        --entrypoint python3 "${IMAGE}" \
+        -c "from huggingface_hub import snapshot_download; snapshot_download('${repo}')"
+    fi
+  done
+  DRAFT_LOCAL="${HF_HOME}/${DRAFT_LOCAL_DIR_NAME}"
+  if [[ ! -s "${DRAFT_LOCAL}/model.safetensors" ]]; then
+    echo "Creating patched drafter copy at ${DRAFT_LOCAL} (architectures -> Qwen3DSparkModel)"
+    snap="$(ls -d "${HF_HOME}"/hub/models--RadixArk--Qwen3.8-27B-DSpark/snapshots/*/ | head -1)"
+    mkdir -p "${DRAFT_LOCAL}"
+    cp -L "${snap}/model.safetensors" "${DRAFT_LOCAL}/"
+    sed 's/"DSparkDraftModel"/"Qwen3DSparkModel"/' "${snap}/config.json" > "${DRAFT_LOCAL}/config.json"
+  fi
+fi
+
+echo "Starting vLLM container for ${MODEL_ID} (NVFP4, ${VARIANT} speculative decoding)"
 echo "Image: ${IMAGE}"
 echo "Served model name: ${SERVED_MODEL_NAME}"
 echo "Listening on ${HOST}:${PORT}"
@@ -186,8 +250,8 @@ docker run -d \
   --tool-call-parser qwen3_coder \
   --enable-auto-tool-choice \
   --media-io-kwargs '{"video": {"num_frames": -1}}' \
-  --speculative-config '{"method": "mtp", "num_speculative_tokens": 5}' \
-  --cudagraph-capture-sizes 1 2 4 6 8 12 16 18 24 30 36 42 48 \
+  --speculative-config "${SPEC_CONFIG}" \
+  --cudagraph-capture-sizes "${LADDER[@]}" \
   >/dev/null
 
 container_id="$(docker inspect -f '{{.Id}}' "${CONTAINER_NAME}")"
@@ -262,7 +326,7 @@ probe_acceptance() {
     /^vllm:spec_decode_num_drafts_total/ {d=$NF} END {print a+0, d+0}')
   # Fails closed: zero drafts (probe requests all failed, metrics unreadable,
   # or spec decode not running at all) counts as unhealthy.
-  python3 - "${before:-0 0}" "${after:-0 0}" <<'PY'
+  python3 - "${before:-0 0}" "${after:-0 0}" "${PROBE_MIN}" <<'PY'
 import sys
 a0, d0 = map(float, sys.argv[1].split())
 a1, d1 = map(float, sys.argv[2].split())
@@ -272,7 +336,7 @@ if drafts <= 0:
     sys.exit(1)
 rate = (a1 - a0) / drafts
 print(f"{rate:.2f}")
-sys.exit(0 if rate >= 0.55 else 1)
+sys.exit(0 if rate >= float(sys.argv[3]) else 1)
 PY
 }
 
@@ -282,15 +346,15 @@ if ! command -v python3 >/dev/null 2>&1; then
 else
   echo "Probing speculative-decode health (MTP position-0 acceptance)..."
   if rate=$(probe_acceptance); then
-    echo "MTP acceptance healthy (position-0 rate ${rate})"
+    echo "Spec-decode acceptance healthy (position-0 rate ${rate})"
   else
-    echo "MTP acceptance degraded (position-0 rate ${rate}) — restarting container once (known per-launch initialization lottery)"
+    echo "Spec-decode acceptance degraded (position-0 rate ${rate}) — restarting container once (known per-launch initialization lottery)"
     docker restart "${CONTAINER_NAME}" >/dev/null
     wait_ready || exit 1
     if rate=$(probe_acceptance); then
-      echo "MTP acceptance healthy after restart (position-0 rate ${rate})"
+      echo "Spec-decode acceptance healthy after restart (position-0 rate ${rate})"
     else
-      echo "WARNING: MTP acceptance still degraded (position-0 rate ${rate}); decode will run ~40% slower than optimal. Try ./stop.sh && ./start.sh"
+      echo "WARNING: spec-decode acceptance still degraded (position-0 rate ${rate}); decode will run ~40% slower than optimal. Try ./stop.sh && ./start.sh"
     fi
   fi
 fi

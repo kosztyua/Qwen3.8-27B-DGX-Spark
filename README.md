@@ -4,8 +4,8 @@
 
 Ready-to-run scripts to serve **[unsloth/Qwen3.8-27B-NVFP4](https://huggingface.co/unsloth/Qwen3.8-27B-NVFP4)** on an NVIDIA DGX Spark (GB10, aarch64), with two interchangeable engines:
 
-- **vLLM** (`./start.sh`, the default) serves the unsloth checkpoint with the full feature set: 262k or 1M context, vision, tool calling, reasoning parsing, MTP speculative decoding.
-- **SGLang + DSpark** (`./start-sglang.sh`) serves the [RadixArk NVFP4 checkpoint](https://huggingface.co/RadixArk/Qwen3.8-27B-NVFP4) of the same model, which decodes real content ~30-50% faster. SGLang cannot serve the unsloth checkpoint correctly today; see [SGLang status](#sglang-status).
+- **vLLM** (`./start.sh`, the default) with two speculative-decoding variants: `VARIANT=mtp` (default — unsloth checkpoint, full feature set, 262k or 1M context, best on unpredictable/batched content) and `VARIANT=dspark` (RadixArk checkpoint + the DSpark block drafter — fastest real-content decode measured on this box: 38-43 tok/s single-stream, 122.8 tok/s aggregate at 8 streams).
+- **SGLang + DSpark** (`./start-sglang.sh`) serves the [RadixArk NVFP4 checkpoint](https://huggingface.co/RadixArk/Qwen3.8-27B-NVFP4); comparable to vLLM's dspark variant on real content, with the best 128k-depth prefill. SGLang cannot serve the unsloth checkpoint correctly today; see [SGLang status](#sglang-status).
 
 Both serve an OpenAI-compatible API on the same port, under different model names (`qwen38-27b-unsloth-nvfp4` vs `qwen38-27b-radixark-nvfp4`) since they serve different quantizations. All performance claims in this README were measured on one DGX Spark on 2026-08-15/16; see [Benchmarks](#benchmarks).
 
@@ -30,9 +30,9 @@ Engine images are **pinned by digest** in the start scripts (both are the 2026-0
 ./download.sh            # add --sglang to also fetch the DSpark drafter
 
 # 2. Start ONE engine (each waits until the API is ready, then exits)
-./start.sh               # vLLM, unsloth checkpoint (full feature set)
-# ...or
-./start-sglang.sh        # SGLang, RadixArk checkpoint (faster decode)
+./start.sh                  # vLLM + MTP, unsloth checkpoint (full feature set)
+VARIANT=dspark ./start.sh   # vLLM + DSpark drafter (fastest real-content decode)
+./start-sglang.sh           # SGLang + DSpark, RadixArk checkpoint
 
 # 3. Use it
 curl http://127.0.0.1:8888/v1/models
@@ -59,11 +59,21 @@ The start scripts are idempotent: if their container is already running they say
 
 Runtime artifacts (`.vllm.log`, `.sglang.log`, pid files, `.cache/`) are git-ignored.
 
+## DSpark speculative decoding (in vLLM and SGLang)
+
+The DSpark block drafter is why the RadixArk-checkpoint configs decode real content so much faster than MTP. MTP drafts sequentially — five recursive passes through one MTP layer, each re-reading the lm_head over the 250k vocab, ~51ms of every 142ms step — while DSpark drafts a 7-token block in a single ~15ms forward of a dedicated 1.4B drafter, and its trained drafts also survive verification better on reasoning and code text.
+
+vLLM ships a native DSpark implementation (`VARIANT=dspark ./start.sh`). Three things make it work, the second two courtesy of a [community PSA](https://www.reddit.com/r/LocalLLM/comments/1vpo15s/psa_qwen3827b_dspark_works_in_vllm/):
+
+- The drafter checkpoint declares `architectures: ["DSparkDraftModel"]`, which vLLM's registry routes to a DeepSeek-V4 class that cannot load it; `start.sh` maintains a local copy patched to `Qwen3DSparkModel`.
+- `"draft_sample_method": "probabilistic"` in the speculative config is worth ~23% over the default greedy drafting.
+- Keep `num_speculative_tokens: 7`: smaller blocks bench worse (per-step overhead dominates), and `enable_adaptive_verification` is rejected by the GDN attention backend, so the drafter's confidence head is unused under vLLM.
+
+Verification differs between engines: vLLM uses lossless rejection sampling (output distribution provably matches the target model); SGLang's default is threshold-based acceptance, which is looser. Quality checks on this box (2026-08-16) were clean for both: 60+ battery runs across looping-prone prompts, code, and exact-answer questions, at recommended sampling and greedy, with zero repetition loops, zero non-terminating responses, and correct answers throughout.
+
 ## SGLang status
 
-**Works with the RadixArk checkpoint (the default); broken with unsloth's.** `./start-sglang.sh` serves [RadixArk/Qwen3.8-27B-NVFP4](https://huggingface.co/RadixArk/Qwen3.8-27B-NVFP4), the NVIDIA-modelopt-format NVFP4 quantization the SGLang community validated. Quality check on this box (2026-08-16): 30+ battery runs across looping-prone prompts, code, and exact-answer questions, at both recommended sampling and greedy, produced zero repetition loops, zero non-terminating responses, and correct answers throughout.
-
-Measured with the RadixArk checkpoint: **38.3 / 37.5 / 45.2 tok/s** single-stream on real code/reasoning/math prompts (vLLM does 28-31 on the same prompts), 35.4 tok/s c=1 and 79.3/90.1 aggregate at 4/6 streams on the random-content benchmark, and roughly double vLLM's prefill speed. vLLM overtakes at 6+ concurrent streams (98.6 at c=6, 106.3 at c=8, where SGLang's scheduler caps at 7 requests) and keeps the bigger feature set; the full matrix is in [Benchmarks](#benchmarks). Choose by workload: SGLang for 1-4 interactive users and long-prompt turnaround, vLLM for higher concurrency, 1M context, vision, or effort control.
+**Works with the RadixArk checkpoint (the default); broken with unsloth's.** `./start-sglang.sh` serves [RadixArk/Qwen3.8-27B-NVFP4](https://huggingface.co/RadixArk/Qwen3.8-27B-NVFP4), the NVIDIA-modelopt-format NVFP4 quantization the SGLang community validated. Since vLLM's `VARIANT=dspark` reached parity on real-content decode, SGLang's remaining edges are the 128k-depth prefill (~1,125 vs ~590 tok/s) and random-content single-stream; vLLM keeps higher concurrency, effort control, and the 1M-context option. The full matrix is in [Benchmarks](#benchmarks).
 
 Trade-offs vs the vLLM setup:
 
@@ -79,8 +89,9 @@ Trade-offs vs the vLLM setup:
 
 | Setting | Default | Notes |
 |---|---|---|
-| `MODEL_ID` | `unsloth/Qwen3.8-27B-NVFP4` | Checkpoint to serve |
-| `SERVED_MODEL_NAME` | `qwen38-27b-unsloth-nvfp4` | Name clients use in API requests (same for both engines) |
+| `VARIANT` | `mtp` | `VARIANT=dspark ./start.sh` serves the RadixArk checkpoint with the DSpark block drafter (k=7, probabilistic draft sampling); see the comparison table |
+| `MODEL_ID` | `unsloth/Qwen3.8-27B-NVFP4` | `RadixArk/Qwen3.8-27B-NVFP4` under `VARIANT=dspark` |
+| `SERVED_MODEL_NAME` | `qwen38-27b-unsloth-nvfp4` | `qwen38-27b-radixark-nvfp4` under `VARIANT=dspark` (`bench.sh` and clients can query `/v1/models`) |
 | `IMAGE` | `vllm/vllm-openai@sha256:b5c860…` | Pinned digest = `nightly-aarch64` of 2026-08-15 (`v0.27.2rc1.dev110`) |
 | `PORT` | `8888` | Listens on `0.0.0.0` via host networking |
 | `--max-model-len` | `262,144` (native) | `CONTEXT_1M=1 ./start.sh` serves 1,000,000 via YaRN |
@@ -122,30 +133,32 @@ All numbers: 1 × DGX Spark GB10, 2026-08-15/16. vLLM serves `unsloth/Qwen3.8-27
 - **Random-content** (`./bench.sh`): `vllm bench serve`, random dataset, fixed seeds, thinking-mode sampling (temp 1.0 / top-p 0.95 / top-k 20), `--ignore-eos`. Comparable and repeatable, but speculative acceptance on random continuations is *lower* than on real text, so these understate real-use decode speed.
 - **Real-workload**: fixed code/reasoning/prose prompts, wall-clock timing. These are the numbers you'll feel in interactive use.
 
-### Engine comparison
+### Configuration comparison
 
-Random-content scenarios (decode: 1k-token prompts, 1k-token generations; concurrencies above each engine's CUDA-graph coverage still run, just less efficiently):
+Random-content scenarios (decode: 1k-token prompts, 1k-token generations):
 
-| Scenario | vLLM (unsloth) | SGLang (RadixArk + DSpark) |
-|---|---|---|
-| Decode, 1 stream | 27.5 tok/s | **35.4 tok/s** |
-| Decode, 4 streams (aggregate) | 65.9 tok/s | **79.3 tok/s** |
-| Decode, 6 streams (aggregate) | **98.6 tok/s** | 90.1 tok/s |
-| Decode, 8 streams (aggregate) | **106.3 tok/s** | not possible (scheduler cap 7) |
-| Prefill 8×16k, 4 streams | 1,339 tok/s | **1,844 tok/s** |
-| Prefill at 128k depth, 1 stream | ~590 tok/s | **~1,125 tok/s** |
-| Decode at 128k context, 1 stream | 17.9 tok/s | 18.4 tok/s |
+| Scenario | vLLM `VARIANT=mtp` | vLLM `VARIANT=dspark` | SGLang + DSpark |
+|---|---|---|---|
+| Decode, 1 stream | **27.5 tok/s** | 20.8 tok/s | 35.4 tok/s* |
+| Decode, 4 streams (aggregate) | 65.9 tok/s | **98.6 tok/s** | 79.3 tok/s |
+| Decode, 6 streams (aggregate) | 98.6 tok/s | — | 90.1 tok/s |
+| Decode, 8 streams (aggregate) | 106.3 tok/s | **122.8 tok/s** | not possible (scheduler cap 7) |
+| Prefill 8×16k, 4 streams | 1,339 tok/s | 1,827 tok/s | **1,844 tok/s** |
+| Prefill at 128k depth, 1 stream | ~590 tok/s | — | **~1,125 tok/s** |
+| Decode at 128k context, 1 stream | 17.9 tok/s | — | 18.4 tok/s |
 
-Real workloads, single stream (greedy; vLLM runs terminated naturally at 700-780 tokens, SGLang's RadixArk runs likewise):
+Real workloads, single stream (greedy, all runs terminated naturally):
 
-| Prompt type | vLLM | SGLang |
-|---|---|---|
-| Code task (thinking) | 28.0 tok/s | **38.3 tok/s** |
-| Reasoning task (thinking) | 31.5 tok/s | **37.5 tok/s** |
-| Math, temp 0.6 (thinking) | — | 45.2 tok/s |
-| Plain-prose continuation (template-free, fixed 700 tokens) | 26.7 tok/s | — |
+| Prompt type | vLLM `VARIANT=mtp` | vLLM `VARIANT=dspark` | SGLang |
+|---|---|---|---|
+| Code task (thinking) | 28.0 tok/s | **42.6 tok/s** | 38.3 tok/s |
+| Reasoning task (thinking) | 31.5 tok/s | **38.5 tok/s** | 37.5 tok/s |
+| Math, temp 0.6 (thinking) | — | 42.6 tok/s | **45.2 tok/s** |
+| Plain-prose continuation (template-free, fixed 700 tokens) | 26.7 tok/s | — | 28.5 tok/s |
 
-Reading the crossover: SGLang wins at 1-4 streams and at prefill; vLLM overtakes from 6 concurrent streams and is the only engine that reaches 8. Keep in mind the engines serve different quantizations of the same base model, so speed is comparable but output quality between the two quants has not been evaluated head-to-head here.
+*A verification-mode footnote on SGLang's random-content c=1 lead: SGLang's DSpark verification is threshold-based rather than strict rejection sampling by default, so it accepts more draft tokens at the cost of exactness of the sampling distribution; vLLM's dspark variant uses lossless rejection sampling. That difference inflates SGLang's random-content numbers in particular and is part of why its ITL-matched runs emit more tokens per step.
+
+Reading the table: `VARIANT=dspark` is the fastest choice for real interactive work and for batched throughput; `VARIANT=mtp` wins on unpredictable single-stream content and is the only 1M-context and vision-validated path; SGLang remains interesting mainly for its 128k-depth prefill. The DSpark speedup is workload-dependent — acceptance ranges from ~2.2 per step on prose to ~4.8 on step-by-step math (community measurement, matching ours), so reasoning-heavy traffic benefits the most. The two checkpoints are different quantizations of the same base model; their output quality has not been compared head-to-head here.
 
 ### Capacity and KV cache
 
