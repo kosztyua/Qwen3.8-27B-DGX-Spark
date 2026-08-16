@@ -22,9 +22,10 @@ set -euo pipefail
 #     build mis-drafts in the 4-token decode path (c=1, k=3) and single-stream
 #     collapses to ~15 tok/s.
 #   - --cudagraph-capture-sizes must contain c*(1+k) for c=1..max-num-seqs or
-#     decode batches run attention eagerly (PR #52000): for k=5 that is
-#     6/12/18/24 (all in the ladder below); a k=2 config would need 3/6/9/12,
-#     i.e. ladder 1 2 3 4 6 8 9 12 16 24.
+#     decode batches run attention eagerly (PR #52000): for k=5 and
+#     max-num-seqs 8 that is 6/12/18/24/30/36/42/48 (all in the ladder
+#     below). Aggregate decode scales well past 4 concurrent streams
+#     (measured: 65.9 tok/s at c=4, 98.6 at c=6, 106.3 at c=8).
 #   - The checkpoint carries a calibrated FP8 kv_cache_scheme (static
 #     per-tensor scales, 2x KV memory savings). We pass --kv-cache-dtype fp8
 #     explicitly (matches vLLM's official recipe; "auto" resolves to the same
@@ -176,7 +177,7 @@ docker run -d \
   --kv-cache-dtype fp8 \
   --gpu-memory-utilization 0.84 \
   "${CONTEXT_ARGS[@]}" \
-  --max-num-seqs 4 \
+  --max-num-seqs 8 \
   --max-num-batched-tokens 8192 \
   --enable-chunked-prefill \
   --enable-prefix-caching \
@@ -186,7 +187,7 @@ docker run -d \
   --enable-auto-tool-choice \
   --media-io-kwargs '{"video": {"num_frames": -1}}' \
   --speculative-config '{"method": "mtp", "num_speculative_tokens": 5}' \
-  --cudagraph-capture-sizes 1 2 4 6 8 12 16 18 24 \
+  --cudagraph-capture-sizes 1 2 4 6 8 12 16 18 24 30 36 42 48 \
   >/dev/null
 
 container_id="$(docker inspect -f '{{.Id}}' "${CONTAINER_NAME}")"

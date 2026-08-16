@@ -63,7 +63,7 @@ Runtime artifacts (`.vllm.log`, `.sglang.log`, pid files, `.cache/`) are git-ign
 
 **Works with the RadixArk checkpoint (the default); broken with unsloth's.** `./start-sglang.sh` serves [RadixArk/Qwen3.8-27B-NVFP4](https://huggingface.co/RadixArk/Qwen3.8-27B-NVFP4), the NVIDIA-modelopt-format NVFP4 quantization the SGLang community validated. Quality check on this box (2026-08-16): 30+ battery runs across looping-prone prompts, code, and exact-answer questions, at both recommended sampling and greedy, produced zero repetition loops, zero non-terminating responses, and correct answers throughout.
 
-Measured with the RadixArk checkpoint: **38.3 / 37.5 / 45.2 tok/s** single-stream on real code/reasoning/math prompts (vLLM does 28-31 on the same prompts) and 20.4 tok/s c=1 / 51.5 c=4 on the random-content benchmark (where vLLM wins with 27.5 / 65.9). Choose by workload: SGLang for interactive reasoning/code speed, vLLM for batched or random-content throughput and the bigger feature set.
+Measured with the RadixArk checkpoint: **38.3 / 37.5 / 45.2 tok/s** single-stream on real code/reasoning/math prompts (vLLM does 28-31 on the same prompts), 35.4 tok/s c=1 and 79.3/90.1 aggregate at 4/6 streams on the random-content benchmark, and roughly double vLLM's prefill speed. vLLM overtakes at 6+ concurrent streams (98.6 at c=6, 106.3 at c=8, where SGLang's scheduler caps at 7 requests) and keeps the bigger feature set; the full matrix is in [Benchmarks](#benchmarks). Choose by workload: SGLang for 1-4 interactive users and long-prompt turnaround, vLLM for higher concurrency, 1M context, vision, or effort control.
 
 Trade-offs vs the vLLM setup:
 
@@ -85,9 +85,9 @@ Trade-offs vs the vLLM setup:
 | `PORT` | `8888` | Listens on `0.0.0.0` via host networking |
 | `--max-model-len` | `262,144` (native) | `CONTEXT_1M=1 ./start.sh` serves 1,000,000 via YaRN |
 | `--gpu-memory-utilization` | `0.84` | ~2.2M-token FP8 KV pool |
-| `--max-num-seqs` | `4` | Concurrent sequences (extra requests queue) |
+| `--max-num-seqs` | `8` | Concurrent sequences (extra requests queue); aggregate decode scales to 106 tok/s at c=8 |
 | `--speculative-config` | MTP, `num_speculative_tokens: 5` | Measured optimum; do **not** use 3 (see Known issues) |
-| `--cudagraph-capture-sizes` | `1 2 4 6 8 12 16 18 24` | Must contain `c×(1+k)` for `c = 1..max-num-seqs` |
+| `--cudagraph-capture-sizes` | `1 2 4 6 8 12 16 18 24 30 36 42 48` | Must contain `c×(1+k)` for `c = 1..max-num-seqs` |
 | `--attention-backend` | `triton_attn` | FlashInfer is faster but mis-drafts at 4-way concurrency (see Known issues) |
 | `--kv-cache-dtype` | `fp8` | The checkpoint's calibrated FP8 KV scheme (~2× KV memory savings vs bf16) |
 
@@ -117,14 +117,52 @@ curl http://127.0.0.1:8888/v1/chat/completions \
 
 ## Benchmarks
 
-All numbers: 1 × DGX Spark GB10, 2026-08-15, both engines serving `unsloth/Qwen3.8-27B-NVFP4`. Two kinds of measurements:
+All numbers: 1 × DGX Spark GB10, 2026-08-15/16. vLLM serves `unsloth/Qwen3.8-27B-NVFP4`; SGLang serves `RadixArk/Qwen3.8-27B-NVFP4` (see [SGLang status](#sglang-status)). Two kinds of measurements:
 
 - **Random-content** (`./bench.sh`): `vllm bench serve`, random dataset, fixed seeds, thinking-mode sampling (temp 1.0 / top-p 0.95 / top-k 20), `--ignore-eos`. Comparable and repeatable, but speculative acceptance on random continuations is *lower* than on real text, so these understate real-use decode speed.
 - **Real-workload**: fixed code/reasoning/prose prompts, wall-clock timing. These are the numbers you'll feel in interactive use.
 
-### vLLM config sweep (random-content, measured under the 1M-YaRN config)
+### Engine comparison
 
-Decode scenarios are 1k-token prompts with 1k-token generations; "accept" is tokens emitted per engine step (max `k+1`).
+Random-content scenarios (decode: 1k-token prompts, 1k-token generations; concurrencies above each engine's CUDA-graph coverage still run, just less efficiently):
+
+| Scenario | vLLM (unsloth) | SGLang (RadixArk + DSpark) |
+|---|---|---|
+| Decode, 1 stream | 27.5 tok/s | **35.4 tok/s** |
+| Decode, 4 streams (aggregate) | 65.9 tok/s | **79.3 tok/s** |
+| Decode, 6 streams (aggregate) | **98.6 tok/s** | 90.1 tok/s |
+| Decode, 8 streams (aggregate) | **106.3 tok/s** | not possible (scheduler cap 7) |
+| Prefill 8×16k, 4 streams | 1,339 tok/s | **1,844 tok/s** |
+| Prefill at 128k depth, 1 stream | ~590 tok/s | **~1,125 tok/s** |
+| Decode at 128k context, 1 stream | 17.9 tok/s | 18.4 tok/s |
+
+Real workloads, single stream (greedy; vLLM runs terminated naturally at 700-780 tokens, SGLang's RadixArk runs likewise):
+
+| Prompt type | vLLM | SGLang |
+|---|---|---|
+| Code task (thinking) | 28.0 tok/s | **38.3 tok/s** |
+| Reasoning task (thinking) | 31.5 tok/s | **37.5 tok/s** |
+| Math, temp 0.6 (thinking) | — | 45.2 tok/s |
+| Plain-prose continuation (template-free, fixed 700 tokens) | 26.7 tok/s | — |
+
+Reading the crossover: SGLang wins at 1-4 streams and at prefill; vLLM overtakes from 6 concurrent streams and is the only engine that reaches 8. Keep in mind the engines serve different quantizations of the same base model, so speed is comparable but output quality between the two quants has not been evaluated head-to-head here.
+
+### Capacity and KV cache
+
+| | vLLM (unsloth) | SGLang (RadixArk) |
+|---|---|---|
+| KV cache dtype in use | FP8 (checkpoint's calibrated scales) | FP8 e4m3 |
+| KV pool | ~2.1M tokens (`--gpu-memory-utilization 0.84`) | 415k tokens (`--mem-fraction-static 0.50`) |
+| Concurrency cap (config/scheduler) | 8 (`--max-num-seqs`, raisable; ladder must follow) | 7 (mamba state cache; `--max-mamba-cache-size` to raise) |
+| Max concurrent 128k-context requests | 8 (config-capped; memory allows ~16) | ~3 (KV-bound) |
+| Max context | 262k native, 1M via `CONTEXT_1M=1` | 262k native |
+| Unallocated memory headroom | ~10 GiB | ~49 GiB (`--mem-fraction-static` could grow) |
+
+On NVFP4 KV cache: vLLM accepts `--kv-cache-dtype nvfp4`, but the only kernels implementing it (FlashInfer's TRT-LLM path) are gated to SM100-family GPUs (B100/B200) — on the GB10 (SM121) no attention backend supports it, so FP8 is the smallest usable KV format here. It is also the format the unsloth checkpoint ships calibrated scales for; a 4-bit KV cache would have no calibration and an unknown quality cost even where supported.
+
+### vLLM config sweep (random-content, measured under the 1M-YaRN config with `--max-num-seqs 4`)
+
+How the shipping vLLM config was chosen; "accept" is tokens emitted per engine step (max `k+1`). The shipping config has since moved to `--max-num-seqs 8`, which left c=1/c=4 results unchanged and added the c=6/c=8 scaling shown above.
 
 | Config | c=1 decode | c=4 decode (aggregate) | Prefill 8×16k, c=4 | Notes |
 |---|---|---|---|---|
@@ -143,22 +181,7 @@ Long context (single stream, 128k-token prompt, measured under the 1M-YaRN confi
 | Prefill throughput at 128k depth | ~555 tok/s | ~590 tok/s |
 | Decode at 128k context | 8.4 tok/s | **17.9 tok/s** |
 
-### Real workloads (vLLM, single stream)
-
-| Prompt type | vLLM MTP k=5 |
-|---|---|
-| Code task (greedy, thinking, terminated naturally at 726 tokens) | 28.0 tok/s |
-| Reasoning task (greedy, thinking, terminated naturally at 780 tokens) | 31.5 tok/s |
-| Plain-prose continuation (template-free, greedy, fixed 700 tokens) | 26.7 tok/s |
-
-SGLang with the RadixArk checkpoint measured 38.3 / 37.5 / 45.2 tok/s on the same code/reasoning/math prompts; see [SGLang status](#sglang-status) for that path's numbers and trade-offs.
-
-### Capacity (vLLM, from the engine startup log)
-
-- GPU KV cache pool: **~2.2M tokens** (FP8) at `--gpu-memory-utilization 0.84`
-- Memory-wise: 2 × 1M-context, ~4 × 512k, ~8 × 262k concurrent sequences; the config caps at 4 concurrent (`--max-num-seqs`)
-- Checkpoint size: 22.6 GB (`model.safetensors` + `model_mtp.safetensors`); DSpark drafter +2.7 GB
-- Live KV usage: `curl -s localhost:8888/metrics | grep kv_cache_usage_perc`; MTP acceptance: `… | grep spec_decode`
+Checkpoint sizes: unsloth 22.6 GB (`model.safetensors` + `model_mtp.safetensors`); RadixArk ~21 GB + 2.7 GB DSpark drafter. Live vLLM metrics: `curl -s localhost:8888/metrics | grep kv_cache_usage_perc` (KV usage) and `… | grep spec_decode` (MTP acceptance).
 
 ### Methodology warnings
 
