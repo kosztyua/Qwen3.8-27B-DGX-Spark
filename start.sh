@@ -131,11 +131,12 @@ esac
 #                         anything higher must extend it or the wider decode
 #                         batches fall back to eager attention (PR #52000) —
 #                         that extension is done automatically here.
-#                         Measured whole-run (seq-steps/s, acceptance-independent,
-#                         = drafts/duration): c=8 15.13, c=12 19.20, c=16 19.96.
-#                         +27% from 8 to 12, then flat (+4%) to 16. 12 is where
-#                         the curve stops paying; 16 is not harmful, it just
-#                         costs KV headroom for almost nothing.
+#                         Measured +9.9% at 12 vs 8 (six runs, three per arm,
+#                         identical prompts, restart between arms; 40.68 -> 44.73
+#                         tok/s, arms non-overlapping, acceptance matched).
+#                         Likely a floor for production, whose longer sessions
+#                         spend less of the run prefilling. c=16 was not measured
+#                         under the controlled method -- treat it as unknown.
 # KV_CACHE_MEMORY=<bytes> Pin the KV pool to an exact size instead of deriving it
 #                         from --gpu-memory-utilization. Deterministic across
 #                         restarts, where the utilization fraction is not: two

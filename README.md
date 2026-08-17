@@ -178,60 +178,34 @@ prefix reuse. Server held at `MAX_SEQS=20` with the pool pinned at 68 GiB so tha
 client concurrency varies**; the ladder covered `c×8` up to 160 throughout. Labels
 `tune-A/B/D/E`, reproducible with `./bench-table.sh tune-`.
 
-**Engine work.** `seq-steps/s` is sequence-steps executed per second — the count of
-`spec_decode_num_drafts` (one per sequence per step) over the run's wall clock. It does
-not depend on how many tokens each step commits, which matters because acceptance length
-is far too noisy here to support a comparison (see below).
+**The measured result: +9.9% at 12 concurrent versus 8.** Six runs, three per arm,
+identical prompt set on both arms (12 prefixes, seed 11908, 3 turns), full server restart
+before every arm so neither inherits the other's prefix cache. Labels `ab-r{1,2,3}-c{8,12}`.
 
-| Concurrency | seq-steps/s | vs previous |
-|---|---|---|
-| 8 | 15.13 | — |
-| **12** | **19.20** | **×1.27** |
-| 16 | 19.96 | ×1.04 |
+| Concurrency | out tok/s | acceptance length | seq-steps/s | wall clock |
+|---|---|---|---|---|
+| 8 | 40.68 ± 0.65 (3.2%) | 2.53 | 16.09 | 906 s |
+| **12** | **44.73 ± 0.79 (3.5%)** | 2.49 | 17.98 | 824 s |
 
-Derived from the whole run of each archived JSON, so there is no window-selection
-freedom: `spec_decode_num_drafts / duration` over `tune-B-s20-kv68/sess{8,12,16}.json`.
-Prefill work per output token is identical across all three (11.00), so the ramp is not
-distorting the comparison.
+Within-arm spread is ~3% and the two arms do not overlap (2.63 tok/s between the worst
+c=12 run and the best c=8 run), so the difference is real. Acceptance length came out
+matched to within 1.7%, which is what should happen with identical prompts and is what
+makes the throughput comparison trustworthy. Zero failed requests, zero preemptions.
 
-**These runs used `SESS_REQS=4`**, which was the default when they were taken; the
-default is now 12. Four turns weights prefill more heavily (~28% of wall clock vs ~18%),
-which is conservative about concurrency rather than flattering — the 12-turn `sess12` run
-(`tune-D-s20-kv68`) reaches a higher engine work rate than its 4-turn counterpart. Rerun
-with `SESS_REQS=4` to compare against this table directly.
+These runs used `SESS_REQS=3`, so roughly 28% of wall clock is prefill. Production
+sessions run ~28 turns, where prefill is a much smaller share and concurrency helps the
+decode phase more — so **+9.9% is likely a floor for real traffic, not a ceiling**.
 
-**The gain is real from 8 to 12 (+27%) and flat from 12 to 16 (+4%).** 12 is where the
-curve stops paying, which is why it is the default — not because 16 is harmful. An
-earlier revision of this section claimed a regression at 16 based on hand-picked
-steady-state windows; those windows could not be reconciled with the runs' wall clocks
-and are withdrawn. If you want the last 4%, `MAX_SEQS=16` is defensible; it costs KV
-headroom (measured 64% pool occupancy at c=16 vs 45% at c=12) and per-stream latency for very little.
+**Two earlier figures in this section were wrong and are withdrawn.** A claimed +33% came
+from hand-picked steady-state windows; a claimed +27% came from whole-run data where each
+concurrency level benchmarked a *different prompt set*, because `sess<c>` ties
+`num_prefixes` to the concurrency. Use `SESS_PREFIXES` and `SESS_SEED` to hold content
+fixed — and run one arm per invocation, since two arms in one invocation share the prefix
+cache (measured: 90.5% of the second arm's input tokens were cache hits).
 
-Zero preemptions at every level.
-
-**Whole-run figures** — what `bench.sh` writes to `bench-results/`, including ramp:
-
-| Label | Scenario | out tok/s | acc len |
-|---|---|---|---|
-| `tune-A-baseline-s8` (cap 8) | sess8 | 45.64 | 2.820 |
-| `tune-B-s20-kv68` | sess8 | 51.74 | 3.426 |
-| `tune-B-s20-kv68` | sess12 | 50.96 | 2.658 |
-| `tune-B-s20-kv68` | sess16 | 50.33 | 2.524 |
-| `tune-D-s20-kv68-long` (12-turn) | sess12 | 57.75 | 2.390 |
-
-**Do not read the concurrency result off tok/s.** Those numbers are nearly flat, and the
-reason is that acceptance length is far too noisy to support the comparison. The
-controlled pair proves it: `tune-A/sess8` and `tune-B/sess8` run the *identical* prompt
-set (seed 11908, 8 prefixes, 4 turns) at the *identical* client concurrency of 8, and
-differ only in server cap and pool size — neither of which can affect which draft tokens
-a target model accepts. Acceptance still moved **2.820 → 3.426, +21.5%**.
-
-So acceptance carries roughly ±20% run-to-run spread at temperature 1.0, and tok/s
-inherits it directly (tok/s = seq-steps/s × acceptance length). The apparent decline in
-acceptance across c=8/12/16 sits inside that spread and should not be read as a
-concurrency effect; neither should any single-run tok/s difference smaller than ~20%.
-`seq-steps/s` is unaffected and is what the concurrency conclusion rests on. Establishing
-an acceptance difference at all would need repeats, not more configurations.
+`c=16` was not measured under the controlled method. The uncontrolled runs suggested a
+plateau rather than a regression, but that evidence has the same defect as the withdrawn
++27%, so treat 16 as unmeasured.
 
 **Raising `MAX_SEQS` alone does nothing.** The engine has to be *offered* the extra work:
 with 8 client connections, `num_requests_waiting` sat at 0 across 3,915 scheduler samples
