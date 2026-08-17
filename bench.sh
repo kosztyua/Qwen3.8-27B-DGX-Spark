@@ -18,6 +18,22 @@
 #   long128k c=1, 128k-token prompts, 256-token generations (long context;
 #            needs CONTEXT_1M=1 or any config with max-model-len > 128k)
 #
+# Session scenarios (sess8/sess12/sess16/sess20) use the prefix_repetition
+# dataset instead of random, because the random scenarios above measure the
+# wrong regime for this box's production traffic. Measured production shape:
+# ~32k median context, 89.6% prefix-cache hit rate, ~850-token generations,
+# arriving as multi-turn agentic sessions rather than independent prompts.
+# Each scenario gives every concurrent slot its own 28k prefix and runs four
+# 4k-suffix requests against it, so intra-session prefix reuse and per-session
+# KV residency both behave like the real thing. Vary only the concurrency
+# across sess8..sess20 to get the batching curve; the server needs
+# --max-num-seqs >= c AND a --cudagraph-capture-sizes ladder covering c*(1+k),
+# or the wider batches silently fall back to eager attention.
+#
+# Absolute tok/s from these is still pessimistic vs real content (synthetic
+# tokens are less predictable, so speculative acceptance runs lower). Compare
+# configs against each other, not against the README's real-content numbers.
+#
 # Reading results: speculative-decode acceptance is content-dependent, so
 # compare configs on ITL (step time) and the reported acceptance length
 # separately, not on raw tok/s alone. The "Speculative Decoding" block is
@@ -78,7 +94,7 @@ run_scenario() {
     --model "${MODEL}" \
     --tokenizer "${TOKENIZER}" \
     --trust-remote-code \
-    --dataset-name random \
+    --dataset-name "${DATASET:-random}" \
     --temperature 1.0 --top-p 0.95 --top-k 20 \
     --ignore-eos \
     --seed "${seed}" \
@@ -111,6 +127,25 @@ want pre16k && run_scenario pre16k 11677 \
 want long128k && run_scenario long128k 11802 \
   --random-input-len 131072 --random-output-len 256 \
   --num-prompts 2 --max-concurrency 1
+
+# One 28k prefix per concurrent slot, four 4k-suffix requests against each.
+# Total input 32,768 tokens; 1k generations. Seeds differ per concurrency so a
+# rerun of the same scenario is reproducible, but note the prompt set is not
+# identical across concurrencies by construction (num_prefixes == c).
+sess() {
+  local c="$1" seed="$2"
+  DATASET=prefix_repetition run_scenario "sess${c}" "${seed}" \
+    --prefix-repetition-prefix-len 28672 \
+    --prefix-repetition-suffix-len 4096 \
+    --prefix-repetition-output-len 1024 \
+    --prefix-repetition-num-prefixes "${c}" \
+    --num-prompts "$((c * 4))" --max-concurrency "${c}"
+}
+
+want sess8  && sess 8  11908
+want sess12 && sess 12 11912
+want sess16 && sess 16 11916
+want sess20 && sess 20 11920
 
 if [[ "${failures}" != "0" ]]; then
   echo "### done with ${failures} FAILED scenario(s); results in ${HOST_RESULTS}"

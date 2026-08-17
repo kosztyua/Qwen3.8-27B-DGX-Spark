@@ -71,6 +71,7 @@ case "${VARIANT}" in
     SPEC_CONFIG='{"method": "mtp", "num_speculative_tokens": 5}'
     # c*(1+k) for c=1..8 at k=5 (see ladder note above)
     LADDER=(1 2 4 6 8 12 16 18 24 30 36 42 48)
+    SPEC_WIDTH=6
     PROBE_MIN="0.55"
     ;;
   dspark)
@@ -100,6 +101,7 @@ case "${VARIANT}" in
     SPEC_CONFIG='{"method": "dspark", "model": "/root/.cache/huggingface/'"${DRAFT_LOCAL_DIR_NAME}"'", "num_speculative_tokens": 7, "draft_sample_method": "probabilistic"}'
     # c*(1+k) for c=1..8 at k=7
     LADDER=(1 2 4 8 16 24 32 40 48 56 64)
+    SPEC_WIDTH=8
     # DSpark position-0 acceptance is legitimately lower than MTP's
     PROBE_MIN="0.25"
     ;;
@@ -108,6 +110,48 @@ case "${VARIANT}" in
     exit 1
     ;;
 esac
+
+# ── tuning knobs (all default to the previously shipped values) ───────────────
+#
+# MAX_SEQS=<n>            Concurrent sequence cap. The capture ladder above only
+#                         covers c=1..8, so anything higher must extend it or the
+#                         wider decode batches fall back to eager attention
+#                         (PR #52000) — that extension is done automatically here.
+# KV_CACHE_MEMORY=<bytes> Pin the KV pool to an exact size instead of deriving it
+#                         from --gpu-memory-utilization. Deterministic across
+#                         restarts, where the utilization fraction is not: it is
+#                         a share of whatever happened to be free at boot.
+#                         68 GiB = 73014444032 holds ~1.27M tokens.
+# SSM_DTYPE=<dtype>       Gated-DeltaNet recurrent state dtype (float32 default).
+#                         48 of 64 layers are GDN and their state is written once
+#                         per draft position, so this is the largest non-weight
+#                         term in the step. bfloat16 halves it — but it perturbs
+#                         the sampled distribution, and under probabilistic
+#                         rejection sampling acceptance = 1 - TV(p,q), so validate
+#                         on acceptance length, not just output quality.
+#                         Use bfloat16, never float16: vLLM's fused GDN decode
+#                         path accepts only float32/bfloat16.
+# PROFILER=1              Expose /start_profile and /stop_profile for a torch
+#                         trace. Development only — do not leave on.
+MAX_SEQS="${MAX_SEQS:-8}"
+if ! [[ "${MAX_SEQS}" =~ ^[0-9]+$ ]] || (( MAX_SEQS < 1 )); then
+  echo "MAX_SEQS must be a positive integer, got '${MAX_SEQS}'"
+  exit 1
+fi
+if (( MAX_SEQS > 8 )); then
+  for (( _c = 9; _c <= MAX_SEQS; _c++ )); do
+    LADDER+=( "$(( SPEC_WIDTH * _c ))" )
+  done
+fi
+
+TUNING_ARGS=()
+[[ -n "${KV_CACHE_MEMORY:-}" ]] && TUNING_ARGS+=(--kv-cache-memory "${KV_CACHE_MEMORY}")
+[[ -n "${SSM_DTYPE:-}" ]]       && TUNING_ARGS+=(--mamba-ssm-cache-dtype "${SSM_DTYPE}")
+if [[ -n "${PROFILER:-}" ]]; then
+  TUNING_ARGS+=(--profiler-config '{"profiler": "torch", "torch_profiler_dir": "/root/.cache/huggingface/prof", "max_iterations": 5}')
+fi
+
+
 # Pinned: vllm/vllm-openai:nightly-aarch64 as of 2026-08-15 (see header notes)
 IMAGE="vllm/vllm-openai@sha256:b5c860acda75d737a8e58cc99ba86ff13982695dceae194f906c2d7b54979358"
 CONTAINER_NAME="qwen3.8-27b-nvfp4"
@@ -261,7 +305,8 @@ docker run -d \
   --kv-cache-dtype fp8 \
   --gpu-memory-utilization 0.84 \
   "${CONTEXT_ARGS[@]}" \
-  --max-num-seqs 8 \
+  "${TUNING_ARGS[@]}" \
+  --max-num-seqs "${MAX_SEQS}" \
   --max-num-batched-tokens 8192 \
   --enable-chunked-prefill \
   --enable-prefix-caching \
