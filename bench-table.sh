@@ -30,9 +30,6 @@ for path in sorted(glob.glob(os.path.join(results, "*", "*.json"))):
     except (OSError, json.JSONDecodeError) as exc:
         print(f"<!-- skipped {label}/{scenario}: {exc} -->")
         continue
-    failed = d.get("failed") or 0
-    if failed:
-        print(f"<!-- {label}/{scenario}: {failed} of {d.get('num_prompts')} requests FAILED -->")
     rows.append((label, scenario, d))
 
 if not rows:
@@ -51,7 +48,10 @@ def fmt(v, spec=".1f"):
 
 # "reqs" matters: sess<c> rows produced with different SESS_REQS have different
 # prefill fractions and are NOT directly comparable.
-hdr = ["label", "scenario", "conc", "reqs", "req/s", "out tok/s", "tot tok/s",
+# "failed" is a real column, not a trailing cell or an HTML comment: markdown
+# renderers silently discard cells beyond the header count, so a failure marker
+# appended to the row is invisible in exactly the rendered view people read.
+hdr = ["label", "scenario", "conc", "reqs", "failed", "req/s", "out tok/s", "tot tok/s",
        "TTFT p50 ms", "TTFT p99 ms", "ITL p50 ms", "ITL p99 ms", "E2EL p50 s",
        "acc len", "acc %"]
 print("| " + " | ".join(hdr) + " |")
@@ -62,6 +62,7 @@ for label, scenario, d in rows:
         scenario,
         fmt(g(d, "max_concurrency"), ".0f"),
         fmt(g(d, "num_prompts"), ".0f"),
+        ("**%d**" % d["failed"]) if (d.get("failed") or 0) else "0",
         fmt(g(d, "request_throughput"), ".4f"),
         fmt(g(d, "output_throughput"), ".2f"),
         fmt(g(d, "total_token_throughput"), ".1f"),
@@ -72,5 +73,5 @@ for label, scenario, d in rows:
         fmt(g(d, "median_e2el_ms", 1e-3), ".1f"),
         fmt(g(d, "spec_decode_acceptance_length"), ".3f"),
         fmt(g(d, "spec_decode_acceptance_rate"), ".1f"),   # already a percentage
-    ]) + (" |" if not (d.get("failed") or 0) else f" | **{d['failed']} FAILED** |"))
+    ]) + " |")
 PY

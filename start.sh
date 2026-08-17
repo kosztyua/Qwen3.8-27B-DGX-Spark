@@ -205,6 +205,10 @@ if (( MAX_SEQS > 8 )); then
 fi
 
 TUNING_ARGS=()
+if [[ -n "${KV_CACHE_MEMORY:-}" ]] && ! [[ "${KV_CACHE_MEMORY}" =~ ^[0123456789]+$ ]]; then
+  echo "KV_CACHE_MEMORY must be a plain byte count (digits only), got '${KV_CACHE_MEMORY}'" >&2
+  exit 1
+fi
 if [[ "${KV_CACHE_MEMORY:-}" =~ ^0+$ ]]; then
   echo "KV_CACHE_MEMORY=0 is not 'off': vLLM treats 0 as unset and silently derives" >&2
   echo "the pool from --gpu-memory-utilization. Use KV_CACHE_MEMORY= (empty) instead." >&2
@@ -284,7 +288,10 @@ if docker ps -a --format '{{.Names}}' | grep -qxF "${CONTAINER_NAME}"; then
     # Now it can silently discard the entire override matrix: someone runs
     # `MAX_SEQS=16 ./start.sh`, sees success, and benchmarks the OLD config.
     # Compare what is actually serving against what we would have launched.
-    mapfile -t _live < <(docker inspect -f '{{range .Args}}{{println .}}{{end}}' "${CONTAINER_NAME}" 2>/dev/null)
+    if ! mapfile -t _live < <(docker inspect -f '{{range .Args}}{{println .}}{{end}}' "${CONTAINER_NAME}" 2>/dev/null) || (( ${#_live[@]} == 0 )); then
+      echo "  (container vanished while inspecting it; re-run ./start.sh)"
+      exit 1
+    fi
     _live_seqs=""; _live_kv=""; _live_ssm=""
     for (( _i = 0; _i < ${#_live[@]}; _i++ )); do
       case "${_live[_i]}" in
@@ -293,7 +300,16 @@ if docker ps -a --format '{{.Names}}' | grep -qxF "${CONTAINER_NAME}"; then
         --mamba-ssm-cache-dtype) _live_ssm="${_live[_i+1]:-}" ;;
       esac
     done
+    _live_model=""
+    for (( _i = 0; _i < ${#_live[@]}; _i++ )); do
+      [[ "${_live[_i]}" == "--served-model-name" ]] && _live_model="${_live[_i+1]:-}"
+      [[ "${_live[_i]}" == "--max-model-len" ]] && _live_len="${_live[_i+1]:-}"
+      [[ "${_live[_i]}" == "--profiler-config" ]] && _live_prof=1
+    done
     _drift=0
+    [[ "${_live_model}" != "${SERVED_MODEL_NAME}" ]] && { echo "  !! running --served-model-name ${_live_model:-<unset>}, this invocation wanted ${SERVED_MODEL_NAME} (VARIANT/DSPARK_TARGET differs)"; _drift=1; }
+    [[ "${_live_len:-}" != "${CONTEXT_ARGS[1]:-}" ]] && { echo "  !! running --max-model-len ${_live_len:-<unset>}, this invocation wanted ${CONTEXT_ARGS[1]:-<unset>} (CONTEXT_1M differs)"; _drift=1; }
+    [[ "${_live_prof:-0}" != "$([[ "${PROFILER:-0}" == "1" ]] && echo 1 || echo 0)" ]] && { echo "  !! profiler state differs between the running server and this invocation"; _drift=1; }
     [[ "${_live_seqs}" != "${MAX_SEQS}" ]] && { echo "  !! running --max-num-seqs ${_live_seqs:-<unset>}, this invocation wanted ${MAX_SEQS}"; _drift=1; }
     [[ "${_live_kv}" != "${KV_CACHE_MEMORY}" ]] && { echo "  !! running --kv-cache-memory ${_live_kv:-<unset>}, this invocation wanted ${KV_CACHE_MEMORY:-<unset>}"; _drift=1; }
     [[ "${_live_ssm}" != "${SSM_DTYPE:-}" ]] && { echo "  !! running --mamba-ssm-cache-dtype ${_live_ssm:-<unset>}, this invocation wanted ${SSM_DTYPE:-<unset>}"; _drift=1; }

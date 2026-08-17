@@ -190,10 +190,15 @@ is far too noisy here to support a comparison (see below).
 | 16 | 19.96 | ×1.04 |
 
 Derived from the whole run of each archived JSON, so there is no window-selection
-freedom:
-`spec_decode_num_drafts / duration` over `tune-B-s20-kv68/sess{8,12,16}.json`.
+freedom: `spec_decode_num_drafts / duration` over `tune-B-s20-kv68/sess{8,12,16}.json`.
 Prefill work per output token is identical across all three (11.00), so the ramp is not
 distorting the comparison.
+
+**These runs used `SESS_REQS=4`**, which was the default when they were taken; the
+default is now 12. Four turns weights prefill more heavily (~28% of wall clock vs ~18%),
+which is conservative about concurrency rather than flattering — the 12-turn `sess12` run
+(`tune-D-s20-kv68`) reaches a higher engine work rate than its 4-turn counterpart. Rerun
+with `SESS_REQS=4` to compare against this table directly.
 
 **The gain is real from 8 to 12 (+27%) and flat from 12 to 16 (+4%).** 12 is where the
 curve stops paying, which is why it is the default — not because 16 is harmful. An
@@ -298,7 +303,7 @@ Long context under `VARIANT=mtp` (single stream, 128k-token prompt, 1M-YaRN conf
 ### Methodology
 
 - Speculative acceptance (and therefore tok/s) is strongly content-dependent. Compare configs on step time (ITL) and acceptance length separately; `bench.sh` pins its seeds so prompts are identical across runs, and servers should be restarted between config comparisons so the prefix cache is cold.
-- **Scenario choice matters more than it looks.** `dec1`/`dec4`/`pre16k` use 1k–16k random-token prompts. Production traffic here is ~32k median context with 89.6% prefix-cache hits arriving as multi-turn sessions, and concurrency measured on short random prompts does not predict concurrency on that shape. The `sess8`/`sess12`/`sess16`/`sess20` scenarios use the `prefix_repetition` dataset: one 28k prefix per concurrent slot, `SESS_REQS` turns of 4k suffix against it. `SESS_REQS=12` (default) puts prefill at ~8% of the window and yields acceptance ~2.31, close to the 2.42–2.46 seen in production; `SESS_REQS=4` puts prefill at ~25% and reads acceptance 2.5–3.5, i.e. optimistically.
+- **Scenario choice matters more than it looks.** `dec1`/`dec4`/`pre16k` use 1k–16k random-token prompts. Production traffic here is ~32k median context with 89.6% prefix-cache hits arriving as multi-turn sessions, and concurrency measured on short random prompts does not predict concurrency on that shape. The `sess8`/`sess12`/`sess16`/`sess20` scenarios use the `prefix_repetition` dataset: one 28k prefix per concurrent slot, `SESS_REQS` turns of 4k suffix against it. `SESS_REQS=12` (the default) puts prefill at roughly 18% of wall clock and recorded acceptance 2.390 in `tune-D-s20-kv68/sess12.json`, close to the 2.42–2.46 seen in production; `SESS_REQS=4` puts prefill at roughly 28% and reads acceptance 2.5–3.5, i.e. optimistically. (Those percentages are solved from `tune-B/sess12` vs `tune-D/sess12` — identical config, 4 vs 12 turns — not from 1/n, which is the fraction of *turns* that are cold rather than the fraction of time spent prefilling.)
 - **For concurrency comparisons use `seq-steps/s` = `steps/s × seqs/step`, not tok/s.** Engine steps come from `vllm:iteration_tokens_total_count`; `vllm:spec_decode_num_drafts_total` counts one draft per *sequence* per step, so `drafts/iterations` is the mean batch occupancy. Because `num_prefixes` tracks concurrency, each `sess<c>` benchmarks a different prompt set, and acceptance differences between them are content artifacts rather than concurrency effects — `seq-steps/s` is invariant to that and `tok/s` is not.
 - `./bench-table.sh [label-prefix …]` renders `bench-results/` as a markdown comparison table.
 - Don't measure vLLM throughput from streaming timestamps: it flushes stream deltas in multi-token bursts, which can inflate first-token-to-last-token rates about 2×. Use wall-clock timing or `bench.sh`.

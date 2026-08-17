@@ -71,6 +71,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 KNOWN_SCENARIOS=",dec1,dec4,pre16k,long128k,sess8,sess12,sess16,sess20,"
+[[ "${SCENARIOS}" == *$'\n'* ]] && { echo "--scenarios must not contain newlines"; exit 1; }
 IFS=',' read -ra _sc <<<"${SCENARIOS}"
 (( ${#_sc[@]} )) || { echo "no scenarios selected (known:${KNOWN_SCENARIOS//,/ })"; exit 1; }
 for _s in "${_sc[@]}"; do
@@ -202,7 +203,11 @@ SESS_SEED="${SESS_SEED:-}"
 for _v in SESS_REQS SESS_PREFIXES; do
   _val="${!_v}"
   [[ -z "${_val}" ]] && continue
-  if ! [[ "${_val}" =~ ^[0-9]{1,4}$ ]] || (( 10#${_val} < 1 )) || (( 10#${_val} > 1000 )); then
+  if ! [[ "${_val}" =~ ^[0123456789]{1,4}$ ]]; then
+    echo "${_v} must be an integer between 1 and 1000, got '${_val}'"
+    exit 1
+  fi
+  if (( 10#${_val} < 1 || 10#${_val} > 1000 )); then
     echo "${_v} must be an integer between 1 and 1000, got '${_val}'"
     exit 1
   fi
