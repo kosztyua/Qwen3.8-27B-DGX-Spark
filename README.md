@@ -80,11 +80,17 @@ Pick the default for interactive and batched work; `VARIANT=mtp` when you need t
 | `IMAGE` | `vllm/vllm-openai@sha256:b5c860…` | Pinned digest = `nightly-aarch64` of 2026-08-15 (`v0.27.2rc1.dev110`) |
 | `PORT` | `8888` | Listens on `0.0.0.0` via host networking |
 | `--max-model-len` | `262,144` (native) | `CONTEXT_1M=1` serves 1,000,000 via YaRN (mtp variant only) |
-| `--gpu-memory-utilization` | `0.84` | KV pool: ~1.4M tokens (dspark) / ~2.1M (mtp) |
-| `--max-num-seqs` | `8` | Concurrent sequences; extra requests queue |
+| `--gpu-memory-utilization` | `0.84` | Profiling guard only; the pool size comes from `--kv-cache-memory` |
+| `--kv-cache-memory` | `73014444032` (68 GiB) | `KV_CACHE_MEMORY=`; 1,274,196 tokens. Pinned because the utilization fraction is not reproducible — see below |
+| `--max-num-seqs` | `12` | `MAX_SEQS=`; the measured knee, see [Concurrency and KV sizing](#concurrency-and-kv-sizing) |
 | `--kv-cache-dtype` | `fp8` | ~2× KV memory savings vs bf16 |
+| `--mamba-ssm-cache-dtype` | unset (`float32`) | `SSM_DTYPE=bfloat16` halves GDN state traffic; see below |
 | `--attention-backend` | `triton_attn` | FlashInfer is faster but mis-drafts at high concurrency (see Known issues) |
-| `--cudagraph-capture-sizes` | per variant | Must contain `c×(1+k)` for `c = 1..max-num-seqs` |
+| `--cudagraph-capture-sizes` | per variant, auto-extended | Must contain `c×(1+k)` for `c = 1..max-num-seqs`; `start.sh` extends the ladder automatically when `MAX_SEQS > 8` |
+
+The `--max-num-seqs` and `--kv-cache-memory` defaults above apply to **`VARIANT=dspark` only**, since that is where they were measured. `VARIANT=mtp` keeps the previously shipped 8 sequences and a utilization-derived pool (it has no separate drafter and a ~2.1M-token pool, so dspark's 68 GiB would shrink it for no measured reason). `MAX_SEQS=8 KV_CACHE_MEMORY= ./start.sh` restores pre-tuning behaviour on either variant.
+
+**Why the KV pool is pinned rather than derived**: `--gpu-memory-utilization` sets a budget as a fraction of total device memory, and vLLM then sizes the KV pool as that budget minus whatever weights, activations and CUDA graphs actually consumed at load time. Those measurements vary slightly run to run, so the resulting pool does too: two starts of the *identical* config measured 1,413,515 and 1,419,112 KV tokens. The drift is small, but it makes cross-restart benchmarking imprecise, so the pool is now pinned in bytes and reproduces exactly (1,274,196 tokens every start).
 
 **Context length**: the model's native context is 262,144 tokens, served by default with no RoPE modification. `CONTEXT_1M=1 VARIANT=mtp ./start.sh` applies the model card's static-YaRN recipe (factor 4.0) for 1M tokens; per the model card, static YaRN can slightly degrade short-context quality, which is why it is opt-in. A single 1M-token sequence needs ~32 GB of KV.
 
@@ -158,11 +164,94 @@ Measured head-to-head on this box (same vLLM engine, greedy):
 | | vLLM DSpark (default) | vLLM MTP | SGLang |
 |---|---|---|---|
 | KV cache dtype | FP8 e4m3 | FP8 (calibrated scales) | FP8 e4m3 |
-| KV pool | ~1.4M tokens | ~2.1M tokens | 415k tokens |
-| Concurrency cap | 8 (`--max-num-seqs`, raisable) | 8 (same) | 7 (mamba state cache) |
-| Max concurrent 128k requests | ~10 (memory), 8 (config) | ~16 (memory), 8 (config) | ~3 (KV-bound) |
+| KV pool | 1,274,196 tokens (pinned 68 GiB) | ~2.1M tokens | 415k tokens |
+| Concurrency cap | 12 (`MAX_SEQS`, measured knee) | 8 (same) | 7 (mamba state cache) |
+| Max concurrent 128k requests | ~9 (memory), 12 (config) | ~16 (memory), 8 (config) | ~3 (KV-bound) |
 
 Checkpoint sizes: RadixArk ~21.9 GB + 2.7 GB drafter; unsloth 22.6 GB including its MTP head. Live vLLM metrics: `curl -s localhost:8888/metrics | grep kv_cache_usage_perc` (KV usage) and `… | grep spec_decode` (acceptance). NVFP4 KV cache is not possible on this machine: vLLM accepts the flag, but the only implementing kernels (FlashInfer's TRT-LLM path) are gated to SM100-family GPUs, and GB10 is SM121, so FP8 is the floor here.
+
+### Concurrency and KV sizing
+
+Measured 2026-08-17 with the `sess*` scenarios (see Methodology), which model the
+production shape: ~32k context, one 28k prefix per concurrent slot, high intra-session
+prefix reuse. Server held at `MAX_SEQS=20` with the pool pinned at 68 GiB so that **only
+client concurrency varies**; the ladder covered `c×8` up to 160 throughout. Labels
+`tune-A/B/D/E`, reproducible with `./bench-table.sh tune-`.
+
+**The measured result: +9.9% at 12 concurrent versus 8.** Six runs, three per arm,
+identical prompt set on both arms (12 prefixes, seed 11908, 3 turns), full server restart
+before every arm so neither inherits the other's prefix cache. Labels `ab-r{1,2,3}-c{8,12}`.
+
+| Concurrency | out tok/s | acceptance length | seq-steps/s | wall clock |
+|---|---|---|---|---|
+| 8 | 40.68 ± 0.65 (3.2%) | 2.53 | 16.09 | 906 s |
+| **12** | **44.73 ± 0.79 (3.5%)** | 2.49 | 17.98 | 824 s |
+
+Within-arm spread is ~3% and the two arms do not overlap (2.63 tok/s between the worst
+c=12 run and the best c=8 run), so the difference is real. Acceptance length came out
+matched to within 1.7%, which is what should happen with identical prompts and is what
+makes the throughput comparison trustworthy. Zero failed requests, zero preemptions.
+
+These runs used `SESS_REQS=3`, so roughly 28% of wall clock is prefill. Production
+sessions run ~28 turns, where prefill is a much smaller share and concurrency helps the
+decode phase more — so **+9.9% is likely a floor for real traffic, not a ceiling**.
+
+**Two earlier figures in this section were wrong and are withdrawn.** A claimed +33% came
+from hand-picked steady-state windows; a claimed +27% came from whole-run data where each
+concurrency level benchmarked a *different prompt set*, because `sess<c>` ties
+`num_prefixes` to the concurrency. Use `SESS_PREFIXES` and `SESS_SEED` to hold content
+fixed — and run one arm per invocation, since two arms in one invocation share the prefix
+cache (measured: 90.5% of the second arm's input tokens were cache hits).
+
+`c=16` was not measured under the controlled method. The uncontrolled runs suggested a
+plateau rather than a regression, but that evidence has the same defect as the withdrawn
++27%, so treat 16 as unmeasured.
+
+**Raising `MAX_SEQS` alone does nothing.** The engine has to be *offered* the extra work:
+with 8 client connections, `num_requests_waiting` sat at 0 across 3,915 scheduler samples
+of production traffic. This is a paired change — server cap and client worker count move
+together.
+
+### GDN state precision (`SSM_DTYPE`)
+
+48 of the 64 layers are Gated DeltaNet, and their recurrent state is 48 v-heads × 128 ×
+128 × 4 B = 3.15 MB per layer per sequence at `float32`. Under speculative decoding vLLM
+keeps a state per draft position for rollback, so each step is 1 read + `k+1` writes — at
+k=7 and c=12 roughly 16 GB of a ~55 GB step, the largest non-weight term.
+`SSM_DTYPE=bfloat16` halves it.
+
+Measured at c=12, `tune-B/sess12` (fp32) vs `tune-E-s20-kv68-bf16ssm/sess12` (bf16), same
+seed and prompt set:
+
+| | `float32` | `bfloat16` | |
+|---|---|---|---|
+| ms/step (steady state, batch matched) | 411.0 | 390.4 | −5.0% |
+| Whole-run out tok/s | 50.96 | 52.20 | **+2.4%** |
+| Whole-run acceptance length | 2.658 | 2.454 | −7.7% |
+| KV pool @ 68 GiB | 1,274,196 tok | **1,344,234 tok** | +5.5% |
+
+**Net +2.4%, and it is not shipped by default.** The engine step really does get faster —
+that part is mechanical and matches the byte accounting. But the acceptance figure moved
+−7.7%, which is inside the ±20% noise floor established above and therefore neither
+confirms nor rules out the predicted cost: bf16 perturbs the sampled distribution, and
+under probabilistic rejection sampling acceptance = 1 − TV(p, q). A real 7.7% acceptance
+loss would more than cancel a 5% step-time gain. Resolving it needs repeats.
+
+Given a single run, a gain inside the noise, and thousands of hours of long-context batch
+work to protect, `SSM_DTYPE` stays unset. Enable it with `SSM_DTYPE=bfloat16 ./start.sh`
+if you want to pursue it — and measure acceptance across repeats, not one run.
+
+The KV gain is a second-order effect worth knowing about regardless: a smaller SSM state
+shrinks the mamba page, so the forced attention block size drops 1648 → 880 tokens and
+the same pinned pool holds ~70k more tokens (page padding rises 0.73% → 1.38%, the
+smaller cost).
+
+**Degeneration check.** The documented failure mode for reduced SSM precision is
+verbosity and repetition at depth, not wrong answers, so a short-context accuracy
+benchmark would not catch it. Ten requests at 58k context under bf16, generating up to
+12,288 tokens each, showed **no repeated n-grams at all**. Verbosity was not measurable:
+at the model's default `xhigh` reasoning effort nothing terminated naturally even at a
+12,288-token cap, and no `float32` control arm was run.
 
 ### MTP variant tuning history
 
@@ -188,6 +277,9 @@ Long context under `VARIANT=mtp` (single stream, 128k-token prompt, 1M-YaRN conf
 ### Methodology
 
 - Speculative acceptance (and therefore tok/s) is strongly content-dependent. Compare configs on step time (ITL) and acceptance length separately; `bench.sh` pins its seeds so prompts are identical across runs, and servers should be restarted between config comparisons so the prefix cache is cold.
+- **Scenario choice matters more than it looks.** `dec1`/`dec4`/`pre16k` use 1k–16k random-token prompts. Production traffic here is ~32k median context with 89.6% prefix-cache hits arriving as multi-turn sessions, and concurrency measured on short random prompts does not predict concurrency on that shape. The `sess8`/`sess12`/`sess16`/`sess20` scenarios use the `prefix_repetition` dataset: one 28k prefix per concurrent slot, `SESS_REQS` turns of 4k suffix against it. `SESS_REQS=12` (the default) puts prefill at roughly 18% of wall clock and recorded acceptance 2.390 in `tune-D-s20-kv68/sess12.json`, close to the 2.42–2.46 seen in production; `SESS_REQS=4` puts prefill at roughly 28% and reads acceptance 2.5–3.5, i.e. optimistically. (Those percentages are solved from `tune-B/sess12` vs `tune-D/sess12` — identical config, 4 vs 12 turns — not from 1/n, which is the fraction of *turns* that are cold rather than the fraction of time spent prefilling.)
+- **For concurrency comparisons use `seq-steps/s` = `steps/s × seqs/step`, not tok/s.** Engine steps come from `vllm:iteration_tokens_total_count`; `vllm:spec_decode_num_drafts_total` counts one draft per *sequence* per step, so `drafts/iterations` is the mean batch occupancy. Because `num_prefixes` tracks concurrency, each `sess<c>` benchmarks a different prompt set, and acceptance differences between them are content artifacts rather than concurrency effects — `seq-steps/s` is invariant to that and `tok/s` is not.
+- `./bench-table.sh [label-prefix …]` renders `bench-results/` as a markdown comparison table.
 - Don't measure vLLM throughput from streaming timestamps: it flushes stream deltas in multi-token bursts, which can inflate first-token-to-last-token rates about 2×. Use wall-clock timing or `bench.sh`.
 
 ## SGLang status
@@ -228,6 +320,7 @@ Long context under `VARIANT=mtp` (single stream, 128k-token prompt, 1M-YaRN conf
 ├── stop.sh           # stop whichever engine is running
 ├── memguard.sh       # runtime memory guard (started by the start scripts)
 ├── bench.sh          # benchmark whatever is serving
+├── bench-table.sh    # render bench-results/ as a markdown comparison table
 ├── .gitignore        # excludes .cache/, logs, pid files
 ├── LICENSE
 └── README.md

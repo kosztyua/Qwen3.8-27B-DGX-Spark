@@ -51,7 +51,7 @@ cd "$(dirname "$0")"
 #     block drafter (k=7, probabilistic draft sampling — greedy drafting
 #     measures ~23% slower). Fastest measured config: 38-43 tok/s
 #     single-stream on real reasoning/code content, 122.8 tok/s aggregate at
-#     8 streams. 262k context, ~1.4M-token KV pool.
+#     8 streams. 262k context, 1,274,196-token KV pool (pinned 68 GiB).
 #     DSPARK_TARGET=unsloth swaps in the unsloth checkpoint (works, ~10-30%
 #     slower; see README).
 #   VARIANT=mtp: unsloth checkpoint + its built-in MTP head (k=5). Best on
@@ -71,7 +71,14 @@ case "${VARIANT}" in
     SPEC_CONFIG='{"method": "mtp", "num_speculative_tokens": 5}'
     # c*(1+k) for c=1..8 at k=5 (see ladder note above)
     LADDER=(1 2 4 6 8 12 16 18 24 30 36 42 48)
+    SPEC_WIDTH=6
     PROBE_MIN="0.55"
+    # The concurrency/KV tuning below was measured on the dspark variant only.
+    # MTP has no separate drafter and a ~2.1M-token pool, so pinning dspark's
+    # 68 GiB here would shrink it for no measured reason. Keep MTP on the
+    # previously shipped defaults until someone benchmarks it.
+    DEFAULT_MAX_SEQS=8
+    DEFAULT_KV_CACHE_MEMORY=""
     ;;
   dspark)
     # DSPARK_TARGET=radixark (default): fastest measured config overall.
@@ -100,14 +107,92 @@ case "${VARIANT}" in
     SPEC_CONFIG='{"method": "dspark", "model": "/root/.cache/huggingface/'"${DRAFT_LOCAL_DIR_NAME}"'", "num_speculative_tokens": 7, "draft_sample_method": "probabilistic"}'
     # c*(1+k) for c=1..8 at k=7
     LADDER=(1 2 4 8 16 24 32 40 48 56 64)
+    SPEC_WIDTH=8
     # DSpark position-0 acceptance is legitimately lower than MTP's
     PROBE_MIN="0.25"
+    # Measured optimum for this variant (README "Concurrency and KV sizing").
+    DEFAULT_MAX_SEQS=12
+    DEFAULT_KV_CACHE_MEMORY=73014444032   # 68 GiB -> 1,274,196 tokens
     ;;
   *)
     echo "Unknown VARIANT '${VARIANT}' (expected 'mtp' or 'dspark')"
     exit 1
     ;;
 esac
+
+# ── tuning knobs ─────────────────────────────────────────────────────────────
+#
+# MAX_SEQS and KV_CACHE_MEMORY default to the measured optimum, which is NOT
+# what shipped before: the old behaviour is MAX_SEQS=8 KV_CACHE_MEMORY= (empty).
+# SSM_DTYPE and PROFILER default to off.
+#
+# MAX_SEQS=<n>            Concurrent sequence cap; default 12, the measured knee.
+#                         The per-variant ladder above only covers c=1..8, so
+#                         anything higher must extend it or the wider decode
+#                         batches fall back to eager attention (PR #52000) —
+#                         that extension is done automatically here.
+#                         Measured +9.9% at 12 vs 8 (six runs, three per arm,
+#                         identical prompts, restart between arms; 40.68 -> 44.73
+#                         tok/s, arms non-overlapping, acceptance matched).
+#                         Likely a floor for production, whose longer sessions
+#                         spend less of the run prefilling. c=16 was not measured
+#                         under the controlled method -- treat it as unknown.
+# KV_CACHE_MEMORY=<bytes> Pin the KV pool to an exact size instead of deriving it
+#                         from --gpu-memory-utilization. Deterministic across
+#                         restarts, where the utilization fraction is not: two
+#                         starts of the identical config measured 1,413,515 and
+#                         1,419,112 KV tokens, because 0.84 is a share of
+#                         whatever happened to be free at boot. Default
+#                         73014444032 (68 GiB) = 1,274,196 tokens. 12 sessions of
+#                         ~32k live context is 393k tokens = 31% of the pool; the
+#                         45% observed in benchmarks is that plus retained
+#                         prefix-cache blocks, which is what the pool is for.
+#                         Set KV_CACHE_MEMORY= (empty) to restore the old
+#                         utilization-derived sizing.
+# SSM_DTYPE=<dtype>       Gated-DeltaNet recurrent state dtype (float32 default).
+#                         48 of 64 layers are GDN and their state is written once
+#                         per draft position, so this is the largest non-weight
+#                         term in the step. bfloat16 halves it — but it perturbs
+#                         the sampled distribution, and under probabilistic
+#                         rejection sampling acceptance = 1 - TV(p,q), so validate
+#                         on acceptance length, not just output quality.
+#                         Use bfloat16, never float16: vLLM's fused GDN decode
+#                         path accepts only float32/bfloat16.
+# PROFILER=1              Expose /start_profile and /stop_profile for a torch
+#                         trace. Only the exact value 1 enables it; anything else
+#                         (0, no, false, empty, unset) leaves it off. Development
+#                         only — do not leave on.
+#
+# Defaults come from the variant block above, because the tuning was measured on
+# dspark only: dspark defaults to the measured optimum (12 / 68 GiB), mtp keeps
+# the previously shipped 8 / utilization-derived. MAX_SEQS=8 with
+# KV_CACHE_MEMORY= (empty) restores the pre-tuning behaviour on either.
+MAX_SEQS="${MAX_SEQS:-${DEFAULT_MAX_SEQS}}"
+# Note the '-' rather than ':-': an explicitly empty KV_CACHE_MEMORY= means
+# "fall back to deriving the pool from --gpu-memory-utilization", while unset
+# means "use the variant default".
+KV_CACHE_MEMORY="${KV_CACHE_MEMORY-${DEFAULT_KV_CACHE_MEMORY}}"
+# Bounded because the ladder loop below allocates per iteration: MAX_SEQS=1e19
+# once grew a bash array until memguard killed the engine (2026-08-17). The
+# pattern rejects leading zeros, so the arithmetic below is unambiguous.
+if ! [[ "${MAX_SEQS}" =~ ^[1-9][0-9]{0,2}$ ]] || (( MAX_SEQS > 256 )); then
+  echo "MAX_SEQS must be an integer between 1 and 256, got '${MAX_SEQS}'"
+  exit 1
+fi
+if (( MAX_SEQS > 8 )); then
+  for (( _c = 9; _c <= MAX_SEQS; _c++ )); do
+    LADDER+=( "$(( SPEC_WIDTH * _c ))" )
+  done
+fi
+
+TUNING_ARGS=()
+[[ -n "${KV_CACHE_MEMORY:-}" ]] && TUNING_ARGS+=(--kv-cache-memory "${KV_CACHE_MEMORY}")
+[[ -n "${SSM_DTYPE:-}" ]]       && TUNING_ARGS+=(--mamba-ssm-cache-dtype "${SSM_DTYPE}")
+if [[ "${PROFILER:-0}" == "1" ]]; then
+  TUNING_ARGS+=(--profiler-config '{"profiler": "torch", "torch_profiler_dir": "/root/.cache/huggingface/prof", "max_iterations": 5}')
+fi
+
+
 # Pinned: vllm/vllm-openai:nightly-aarch64 as of 2026-08-15 (see header notes)
 IMAGE="vllm/vllm-openai@sha256:b5c860acda75d737a8e58cc99ba86ff13982695dceae194f906c2d7b54979358"
 CONTAINER_NAME="qwen3.8-27b-nvfp4"
@@ -171,6 +256,31 @@ if docker ps -a --format '{{.Names}}' | grep -qxF "${CONTAINER_NAME}"; then
   if docker ps --format '{{.Names}}' | grep -qxF "${CONTAINER_NAME}"; then
     echo "Container ${CONTAINER_NAME} is already running"
     echo "Log: ${LOG_FILE}"
+    # This early exit used to be harmless, because the script had no tunables.
+    # Now it can silently discard the entire override matrix: someone runs
+    # `MAX_SEQS=16 ./start.sh`, sees success, and benchmarks the OLD config.
+    # Compare what is actually serving against what we would have launched.
+    if ! mapfile -t _live < <(docker inspect -f '{{range .Args}}{{println .}}{{end}}' "${CONTAINER_NAME}" 2>/dev/null) || (( ${#_live[@]} == 0 )); then
+      echo "  (container vanished while inspecting it; re-run ./start.sh)"
+      exit 1
+    fi
+    _live_seqs=""; _live_kv=""; _live_ssm=""
+    for (( _i = 0; _i < ${#_live[@]}; _i++ )); do
+      case "${_live[_i]}" in
+        --max-num-seqs)          _live_seqs="${_live[_i+1]:-}" ;;
+        --kv-cache-memory)       _live_kv="${_live[_i+1]:-}" ;;
+        --mamba-ssm-cache-dtype) _live_ssm="${_live[_i+1]:-}" ;;
+      esac
+    done
+    _drift=0
+    [[ "${_live_seqs}" != "${MAX_SEQS}" ]] && { echo "  !! running --max-num-seqs ${_live_seqs:-<unset>}, this invocation wanted ${MAX_SEQS}"; _drift=1; }
+    [[ "${_live_kv}" != "${KV_CACHE_MEMORY}" ]] && { echo "  !! running --kv-cache-memory ${_live_kv:-<unset>}, this invocation wanted ${KV_CACHE_MEMORY:-<unset>}"; _drift=1; }
+    [[ "${_live_ssm}" != "${SSM_DTYPE:-}" ]] && { echo "  !! running --mamba-ssm-cache-dtype ${_live_ssm:-<unset>}, this invocation wanted ${SSM_DTYPE:-<unset>}"; _drift=1; }
+    if (( _drift )); then
+      echo "  The running server does NOT match the requested configuration."
+      echo "  Nothing was applied. Restart to apply it:  ./stop.sh && ./start.sh"
+      exit 1
+    fi
     exit 0
   fi
   docker rm "${CONTAINER_NAME}" >/dev/null
@@ -261,7 +371,8 @@ docker run -d \
   --kv-cache-dtype fp8 \
   --gpu-memory-utilization 0.84 \
   "${CONTEXT_ARGS[@]}" \
-  --max-num-seqs 8 \
+  "${TUNING_ARGS[@]}" \
+  --max-num-seqs "${MAX_SEQS}" \
   --max-num-batched-tokens 8192 \
   --enable-chunked-prefill \
   --enable-prefix-caching \
