@@ -30,6 +30,9 @@ for path in sorted(glob.glob(os.path.join(results, "*", "*.json"))):
     except (OSError, json.JSONDecodeError) as exc:
         print(f"<!-- skipped {label}/{scenario}: {exc} -->")
         continue
+    failed = d.get("failed") or 0
+    if failed:
+        print(f"<!-- {label}/{scenario}: {failed} of {d.get('num_prompts')} requests FAILED -->")
     rows.append((label, scenario, d))
 
 if not rows:
@@ -46,8 +49,10 @@ def fmt(v, spec=".1f"):
     return "-" if v is None else format(v, spec)
 
 
-hdr = ["label", "scenario", "conc", "req/s", "out tok/s", "tot tok/s",
-       "TTFT p50", "TTFT p99", "ITL p50", "ITL p99", "E2EL p50",
+# "reqs" matters: sess<c> rows produced with different SESS_REQS have different
+# prefill fractions and are NOT directly comparable.
+hdr = ["label", "scenario", "conc", "reqs", "req/s", "out tok/s", "tot tok/s",
+       "TTFT p50 ms", "TTFT p99 ms", "ITL p50 ms", "ITL p99 ms", "E2EL p50 s",
        "acc len", "acc %"]
 print("| " + " | ".join(hdr) + " |")
 print("|" + "|".join(["---"] * len(hdr)) + "|")
@@ -56,6 +61,7 @@ for label, scenario, d in rows:
         label,
         scenario,
         fmt(g(d, "max_concurrency"), ".0f"),
+        fmt(g(d, "num_prompts"), ".0f"),
         fmt(g(d, "request_throughput"), ".4f"),
         fmt(g(d, "output_throughput"), ".2f"),
         fmt(g(d, "total_token_throughput"), ".1f"),
@@ -66,5 +72,5 @@ for label, scenario, d in rows:
         fmt(g(d, "median_e2el_ms", 1e-3), ".1f"),
         fmt(g(d, "spec_decode_acceptance_length"), ".3f"),
         fmt(g(d, "spec_decode_acceptance_rate"), ".1f"),   # already a percentage
-    ]) + " |")
+    ]) + (" |" if not (d.get("failed") or 0) else f" | **{d['failed']} FAILED** |"))
 PY
