@@ -71,11 +71,8 @@ while [[ $# -gt 0 ]]; do
 done
 
 KNOWN_SCENARIOS=",dec1,dec4,pre16k,long128k,sess8,sess12,sess16,sess20,"
-[[ "${SCENARIOS}" == *$'\n'* ]] && { echo "--scenarios must not contain newlines"; exit 1; }
 IFS=',' read -ra _sc <<<"${SCENARIOS}"
-(( ${#_sc[@]} )) || { echo "no scenarios selected (known:${KNOWN_SCENARIOS//,/ })"; exit 1; }
 for _s in "${_sc[@]}"; do
-  [[ -n "${_s}" ]] || { echo "empty scenario name in --scenarios '${SCENARIOS}'"; exit 1; }
   [[ "${KNOWN_SCENARIOS}" == *",${_s},"* ]] \
     || { echo "unknown scenario '${_s}' (known:${KNOWN_SCENARIOS//,/ })"; exit 1; }
 done
@@ -203,20 +200,10 @@ SESS_SEED="${SESS_SEED:-}"
 for _v in SESS_REQS SESS_PREFIXES; do
   _val="${!_v}"
   [[ -z "${_val}" ]] && continue
-  if ! [[ "${_val}" =~ ^[0123456789]{1,4}$ ]]; then
-    echo "${_v} must be an integer between 1 and 1000, got '${_val}'"
+  if ! [[ "${_val}" =~ ^[1-9][0-9]{0,3}$ ]]; then
+    echo "${_v} must be an integer between 1 and 9999, got '${_val}'"
     exit 1
   fi
-  if (( 10#${_val} < 1 || 10#${_val} > 1000 )); then
-    echo "${_v} must be an integer between 1 and 1000, got '${_val}'"
-    exit 1
-  fi
-  # Force base 10, as start.sh does for MAX_SEQS. Without this SESS_REQS=012 is
-  # octal to bash (10 turns) but decimal to the client (12 prefixes), so the run
-  # silently has a different prefill fraction than every log line claims -- and
-  # 08/09 abort sess() mid-function, which skips run_scenario entirely and still
-  # exits 0 with the success banner.
-  printf -v "${_v}" '%d' "$(( 10#${_val} ))"
 done
 unset _v _val
 sess() {

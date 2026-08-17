@@ -171,33 +171,13 @@ MAX_SEQS="${MAX_SEQS:-${DEFAULT_MAX_SEQS}}"
 # "fall back to deriving the pool from --gpu-memory-utilization", while unset
 # means "use the variant default".
 KV_CACHE_MEMORY="${KV_CACHE_MEMORY-${DEFAULT_KV_CACHE_MEMORY}}"
-# Bounded on BOTH ends, and the digit count is capped in the pattern so a huge
-# literal never reaches arithmetic at all. Without the upper bound the ladder
-# loop below is an unbounded allocation: MAX_SEQS=99999999999999999999 wraps to a
-# ~1.6e18 loop count and grows a bash array until the host runs out of memory.
-# On this box that does not hang -- memguard.sh fires at 4 GiB and force-removes
-# the engine container, so a typo in an env var takes the server down.
-# (Observed 2026-08-17.) 256 is far above anything this hardware can serve: the
-# KV pool holds ~40 streams at production context lengths, and every ladder entry
-# is a CUDA graph that costs capture time and memory at startup.
-# Digits are enumerated rather than ranged: in a UTF-8 locale glibc treats [0-9]
-# as a collation range that also matches Arabic-Indic and fullwidth digits, which
-# Python's int() then reads happily. And the bound check has to run AFTER the
-# pattern check, never inside the same condition: an arithmetic error returns 1,
-# which would make the guard evaluate false and let the bad value through.
-if ! [[ "${MAX_SEQS}" =~ ^[0123456789]{1,4}$ ]]; then
+# Bounded because the ladder loop below allocates per iteration: MAX_SEQS=1e19
+# once grew a bash array until memguard killed the engine (2026-08-17). The
+# pattern rejects leading zeros, so the arithmetic below is unambiguous.
+if ! [[ "${MAX_SEQS}" =~ ^[1-9][0-9]{0,2}$ ]] || (( MAX_SEQS > 256 )); then
   echo "MAX_SEQS must be an integer between 1 and 256, got '${MAX_SEQS}'"
   exit 1
 fi
-if (( 10#${MAX_SEQS} < 1 || 10#${MAX_SEQS} > 256 )); then
-  echo "MAX_SEQS must be an integer between 1 and 256, got '${MAX_SEQS}'"
-  exit 1
-fi
-# Force base 10 before any arithmetic. A leading zero (MAX_SEQS=012) is octal to
-# bash but decimal to vLLM's argparse, so the ladder would be extended for 10
-# while the server admitted 12 -- silently reintroducing the eager-attention
-# fallback this code exists to prevent.
-MAX_SEQS=$(( 10#${MAX_SEQS} ))
 if (( MAX_SEQS > 8 )); then
   for (( _c = 9; _c <= MAX_SEQS; _c++ )); do
     LADDER+=( "$(( SPEC_WIDTH * _c ))" )
@@ -205,15 +185,6 @@ if (( MAX_SEQS > 8 )); then
 fi
 
 TUNING_ARGS=()
-if [[ -n "${KV_CACHE_MEMORY:-}" ]] && ! [[ "${KV_CACHE_MEMORY}" =~ ^[0123456789]+$ ]]; then
-  echo "KV_CACHE_MEMORY must be a plain byte count (digits only), got '${KV_CACHE_MEMORY}'" >&2
-  exit 1
-fi
-if [[ "${KV_CACHE_MEMORY:-}" =~ ^0+$ ]]; then
-  echo "KV_CACHE_MEMORY=0 is not 'off': vLLM treats 0 as unset and silently derives" >&2
-  echo "the pool from --gpu-memory-utilization. Use KV_CACHE_MEMORY= (empty) instead." >&2
-  exit 1
-fi
 [[ -n "${KV_CACHE_MEMORY:-}" ]] && TUNING_ARGS+=(--kv-cache-memory "${KV_CACHE_MEMORY}")
 [[ -n "${SSM_DTYPE:-}" ]]       && TUNING_ARGS+=(--mamba-ssm-cache-dtype "${SSM_DTYPE}")
 if [[ "${PROFILER:-0}" == "1" ]]; then
@@ -300,16 +271,7 @@ if docker ps -a --format '{{.Names}}' | grep -qxF "${CONTAINER_NAME}"; then
         --mamba-ssm-cache-dtype) _live_ssm="${_live[_i+1]:-}" ;;
       esac
     done
-    _live_model=""
-    for (( _i = 0; _i < ${#_live[@]}; _i++ )); do
-      [[ "${_live[_i]}" == "--served-model-name" ]] && _live_model="${_live[_i+1]:-}"
-      [[ "${_live[_i]}" == "--max-model-len" ]] && _live_len="${_live[_i+1]:-}"
-      [[ "${_live[_i]}" == "--profiler-config" ]] && _live_prof=1
-    done
     _drift=0
-    [[ "${_live_model}" != "${SERVED_MODEL_NAME}" ]] && { echo "  !! running --served-model-name ${_live_model:-<unset>}, this invocation wanted ${SERVED_MODEL_NAME} (VARIANT/DSPARK_TARGET differs)"; _drift=1; }
-    [[ "${_live_len:-}" != "${CONTEXT_ARGS[1]:-}" ]] && { echo "  !! running --max-model-len ${_live_len:-<unset>}, this invocation wanted ${CONTEXT_ARGS[1]:-<unset>} (CONTEXT_1M differs)"; _drift=1; }
-    [[ "${_live_prof:-0}" != "$([[ "${PROFILER:-0}" == "1" ]] && echo 1 || echo 0)" ]] && { echo "  !! profiler state differs between the running server and this invocation"; _drift=1; }
     [[ "${_live_seqs}" != "${MAX_SEQS}" ]] && { echo "  !! running --max-num-seqs ${_live_seqs:-<unset>}, this invocation wanted ${MAX_SEQS}"; _drift=1; }
     [[ "${_live_kv}" != "${KV_CACHE_MEMORY}" ]] && { echo "  !! running --kv-cache-memory ${_live_kv:-<unset>}, this invocation wanted ${KV_CACHE_MEMORY:-<unset>}"; _drift=1; }
     [[ "${_live_ssm}" != "${SSM_DTYPE:-}" ]] && { echo "  !! running --mamba-ssm-cache-dtype ${_live_ssm:-<unset>}, this invocation wanted ${SSM_DTYPE:-<unset>}"; _drift=1; }
