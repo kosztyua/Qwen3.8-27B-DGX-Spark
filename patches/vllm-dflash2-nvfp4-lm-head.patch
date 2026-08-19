@@ -1,0 +1,25 @@
+diff --git a/vllm/model_executor/models/qwen3_dflash2.py b/vllm/model_executor/models/qwen3_dflash2.py
+index 796866d9da..3c38a6d28e 100644
+--- a/vllm/model_executor/models/qwen3_dflash2.py
++++ b/vllm/model_executor/models/qwen3_dflash2.py
+@@ -19,5 +19,2 @@ from vllm.model_executor.layers.linear import ReplicatedLinear
+ from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+-from vllm.model_executor.layers.vocab_parallel_embedding import (
+-    UnquantizedEmbeddingMethod,
+-)
+ from vllm.platforms import current_platform
+@@ -319,5 +316,7 @@ class DFlash2Qwen3ForCausalLM(DFlashQwen3ForCausalLM):
+     ) -> tuple[torch.Tensor, torch.Tensor]:
+-        if not isinstance(self.lm_head.quant_method, UnquantizedEmbeddingMethod):
++        quant_method = self.lm_head.quant_method
++        if not callable(getattr(quant_method, "apply", None)):
+             raise ValueError(
+-                "DFlash2 requires an unquantized target LM head for candidate TopK."
++                "DFlash2 requires a target LM head with an apply() path for "
++                f"candidate TopK; got {type(quant_method).__name__}."
+             )
+@@ -325,3 +324,3 @@ class DFlash2Qwen3ForCausalLM(DFlashQwen3ForCausalLM):
+         selector = self.model.candidate_selector
+-        logits = self.lm_head.quant_method.apply(self.lm_head, hidden_states, bias=None)
++        logits = quant_method.apply(self.lm_head, hidden_states, bias=None)
+         num_pad = self.lm_head.shard_indices.num_org_vocab_padding

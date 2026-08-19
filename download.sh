@@ -15,6 +15,7 @@ cd "$(dirname "$0")"
 DEFAULT_REPOS=("RadixArk/Qwen3.8-27B-NVFP4" "RadixArk/Qwen3.8-27B-DSpark")
 MTP_REPOS=("unsloth/Qwen3.8-27B-NVFP4")
 DFLASH2_REPOS=("z-lab/Qwen3.8-27B-DFlash2")
+DFLASH2_REVISION="50307d4c4cde6860d4eee73e2547cd786fe8e8a4"
 case "${1:-}" in
   "" | --sglang) REPOS=("${DEFAULT_REPOS[@]}") ;;
   --mtp)         REPOS=("${MTP_REPOS[@]}") ;;
@@ -36,7 +37,11 @@ for repo in "${REPOS[@]}"; do
   ok=0
   for i in $(seq 1 10); do
     echo "[$repo] attempt $i $(date -Is)"
-    HF_HOME="$PWD/.cache/huggingface" hf download "$repo"
+    revision_args=()
+    if [[ "$repo" == "${DFLASH2_REPOS[0]}" ]]; then
+      revision_args=(--revision "${DFLASH2_REVISION}")
+    fi
+    HF_HOME="$PWD/.cache/huggingface" hf download "$repo" "${revision_args[@]}"
     if [[ $? -eq 0 ]]; then ok=1; break; fi
     echo "retry in 10s"
     sleep 10

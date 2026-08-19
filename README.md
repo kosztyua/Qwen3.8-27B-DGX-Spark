@@ -75,9 +75,9 @@ Pick the default for interactive and batched work; `VARIANT=mtp` when you need t
 
 ### Experimental DFlash 2 candidate
 
-DFlash 2 is a promising evaluation candidate, not a shipped default. Its authors report a 4.80 mean acceptance length versus 3.62 for this repository's DSpark drafter and 27-39% higher task throughput in a matched H200/SGLang comparison. Those results do not transfer directly to this NVFP4 GB10/vLLM stack, and vLLM support is still open PR #52816 with a reported concurrency crash on adjacent SM120 hardware.
+DFlash 2 was evaluated live on this GB10 and remains an experimental candidate, not the default. Matched 1k/1k decode tests improved from 21.92 to 35.90 tok/s at c=1 (+63.8%) and from 66.07 to 142.27 tok/s at c=4 (+115.3%); both c=1 and c=4 100-request soaks passed, and the reported adjacent-SM120 concurrency crash did not reproduce. The tradeoff is substantial: the 16k-prefill test regressed 9.6% in total throughput / 44.0% in mean TTFT, and the 128k test regressed 36.5% / 97.0%, respectively. The candidate therefore fails the repository's prefill/TTFT promotion gate.
 
-This branch prepares a fail-closed `VARIANT=dflash2`: it requires both `DFLASH2_EXPERIMENTAL=1` and a caller-supplied `DFLASH2_IMAGE` pinned by digest, starts at one sequence with automatic KV profiling, and leaves normal `./start.sh` behavior unchanged. See [DFLASH2_EVALUATION.md](DFLASH2_EVALUATION.md) for the evidence, risks, exact upstream commit reviewed, and staged promotion gates.
+The fail-closed `VARIANT=dflash2` requires both `DFLASH2_EXPERIMENTAL=1` and a caller-supplied immutable `DFLASH2_IMAGE`, starts at one sequence with automatic KV profiling, and leaves normal `./start.sh` behavior unchanged. vLLM support is still open PR #52816; the RadixArk target also needs the checked-in NVFP4 LM-head patch, and DFlash compile caches are isolated by `MAX_SEQS` after a cross-concurrency AOT-cache failure. See [DFLASH2_EVALUATION.md](DFLASH2_EVALUATION.md) for the exact commits, reproducible build, raw-result locations, caveats, and gate decisions.
 
 ### Serving settings (vLLM)
 

@@ -60,15 +60,17 @@ cd "$(dirname "$0")"
 #     unpredictable single-stream content (27.5 tok/s random c=1) and the
 #     only variant with the CONTEXT_1M option and vision validation.
 #   VARIANT=dflash2: experimental z-lab 1.9B DFlash 2 drafter (k=7) over the
-#     RadixArk target. Upstream H200 measurements are promising, but vLLM
-#     support is still PR-only and has not been validated on GB10. It is
-#     fail-closed behind DFLASH2_EXPERIMENTAL=1 and DFLASH2_IMAGE=<digest>.
+#     RadixArk target. Local GB10 c=1/c=4 decode tests are promising, but the
+#     candidate failed the prefill/TTFT promotion gates and vLLM support is
+#     still PR-only. It remains fail-closed behind DFLASH2_EXPERIMENTAL=1 and
+#     DFLASH2_IMAGE=<digest>.
 # The dspark drafter config needs its architectures field patched from
 # DSparkDraftModel (which vLLM's registry routes to a DeepSeek-V4 class) to
 # Qwen3DSparkModel; this script maintains a patched local copy automatically.
 VARIANT="${VARIANT:-dspark}"
 DSPARK_DRAFT_ID="RadixArk/Qwen3.8-27B-DSpark"
 DFLASH2_DRAFT_ID="z-lab/Qwen3.8-27B-DFlash2"
+DFLASH2_DRAFT_REVISION="50307d4c4cde6860d4eee73e2547cd786fe8e8a4"
 DRAFT_LOCAL_DIR_NAME="dspark-qwen38-local"
 case "${VARIANT}" in
   mtp)
@@ -125,13 +127,14 @@ case "${VARIANT}" in
   dflash2)
     if [[ "${DFLASH2_EXPERIMENTAL:-0}" != "1" ]]; then
       cat <<'MSG'
-VARIANT=dflash2 is preparation-only and not validated on DGX Spark. Its vLLM
-support is still an open upstream PR, and a concurrency crash has been reported
-on adjacent SM120 hardware. See DFLASH2_EVALUATION.md.
+VARIANT=dflash2 is experimental. Local DGX Spark testing found large decode
+gains at c=1/c=4, but it failed the prefill/TTFT promotion gates. Its vLLM
+support is still an open upstream PR and the NVFP4 target needs a local
+compatibility patch. See DFLASH2_EVALUATION.md.
 
 After building and pinning a compatible image, explicitly opt in with:
 
-    DFLASH2_EXPERIMENTAL=1 DFLASH2_IMAGE=<image@sha256:...> VARIANT=dflash2 ./start.sh
+    DFLASH2_EXPERIMENTAL=1 DFLASH2_IMAGE=<image@sha256:...|sha256:...> VARIANT=dflash2 ./start.sh
 MSG
       exit 1
     fi
@@ -140,15 +143,15 @@ MSG
       echo "The repository's normal pinned vLLM image predates DFlash 2 support."
       exit 1
     fi
-    if ! [[ "${DFLASH2_IMAGE}" =~ @sha256:[0-9a-f]{64}$ ]]; then
-      echo "DFLASH2_IMAGE must end in @sha256:<64 lowercase hex characters>; tags are intentionally rejected."
+    if ! [[ "${DFLASH2_IMAGE}" =~ @sha256:[0-9a-f]{64}$|^sha256:[0-9a-f]{64}$ ]]; then
+      echo "DFLASH2_IMAGE must be a registry digest (...@sha256:<64 hex>) or local image ID (sha256:<64 hex>); tags are rejected."
       exit 1
     fi
     MODEL_ID="RadixArk/Qwen3.8-27B-NVFP4"
     SERVED_MODEL_NAME="qwen38-27b-radixark-nvfp4"
     DRAFT_ID="${DFLASH2_DRAFT_ID}"
     QUANT_ARGS=()
-    SPEC_CONFIG='{"method": "dflash", "model": "'"${DRAFT_ID}"'", "num_speculative_tokens": 7}'
+    SPEC_CONFIG='{"method": "dflash", "model": "'"${DRAFT_ID}"'", "revision": "'"${DFLASH2_DRAFT_REVISION}"'", "num_speculative_tokens": 7}'
     # c*(1+k) for c=1..8 at k=7
     LADDER=(1 2 4 8 16 24 32 40 48 56 64)
     SPEC_WIDTH=8
@@ -265,6 +268,15 @@ VLLM_CACHE_DIR="${WORK_DIR}/.cache/vllm"
 FLASHINFER_CACHE_DIR="${WORK_DIR}/.cache/flashinfer"
 READY_URL="http://127.0.0.1:${PORT}/v1/models"
 
+# The current DFlash2 AOT key does not include the padded draft batch shape.
+# Reusing an artifact compiled at MAX_SEQS=1 for MAX_SEQS=4 fails profiling
+# with `expected size 4==1`. Keep its vLLM cache root concurrency-specific.
+# Other variants retain the historical cache location unchanged.
+VLLM_CACHE_ROOT_IN_CONTAINER="/root/.cache/vllm"
+if [[ "${VARIANT}" == "dflash2" ]]; then
+  VLLM_CACHE_ROOT_IN_CONTAINER="/root/.cache/vllm/dflash2-maxseqs-${MAX_SEQS}"
+fi
+
 # Context: native 262,144 tokens by default (no RoPE modification, no quality
 # caveat). CONTEXT_1M=1 ./start.sh extends to 1M via static YaRN (model card
 # "Processing Ultra-Long Texts": factor 4.0 over the native 262144, applied
@@ -365,13 +377,21 @@ echo "OK: ${mem_avail} GiB available"
 if [[ "${VARIANT}" == "dspark" || "${VARIANT}" == "dflash2" ]]; then
   for repo in "${MODEL_ID}" "${DRAFT_ID}"; do
     cache_dir="${HF_HOME}/hub/models--${repo//\//--}"
-    if ! ls "${cache_dir}"/snapshots/*/*.safetensors >/dev/null 2>&1; then
+    snapshot_glob="${cache_dir}/snapshots/*/*.safetensors"
+    if [[ "${repo}" == "${DFLASH2_DRAFT_ID}" ]]; then
+      snapshot_glob="${cache_dir}/snapshots/${DFLASH2_DRAFT_REVISION}/*.safetensors"
+    fi
+    if ! compgen -G "${snapshot_glob}" >/dev/null; then
       echo "${repo} not in cache — downloading"
+      revision_kwarg=""
+      if [[ "${repo}" == "${DFLASH2_DRAFT_ID}" ]]; then
+        revision_kwarg=", revision='${DFLASH2_DRAFT_REVISION}'"
+      fi
       docker run --rm --network host \
         -e HF_HOME=/root/.cache/huggingface -e HF_TOKEN="${HF_TOKEN:-}" \
         -v "${HF_HOME}:/root/.cache/huggingface" \
         --entrypoint python3 "${IMAGE}" \
-        -c "from huggingface_hub import snapshot_download; snapshot_download('${repo}')"
+        -c "from huggingface_hub import snapshot_download; snapshot_download('${repo}'${revision_kwarg})"
     fi
   done
   if [[ "${VARIANT}" == "dspark" ]]; then
@@ -409,6 +429,7 @@ docker run -d \
   -e VLLM_FLOAT32_MATMUL_PRECISION=high \
   -e CUTE_DSL_ARCH=sm_121a \
   -e VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 \
+  -e VLLM_CACHE_ROOT="${VLLM_CACHE_ROOT_IN_CONTAINER}" \
   -e HF_HOME=/root/.cache/huggingface \
   -e TRITON_CACHE_DIR=/root/.triton \
   -e HF_TOKEN="${HF_TOKEN:-}" \
