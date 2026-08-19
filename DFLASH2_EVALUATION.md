@@ -57,8 +57,8 @@ reproducibility anchors were:
 - hybrid GDN cache PR #52244 head
   `62cbf34259002207e237eec5b5af79f75cc1606c`.
 
-Review those anchors on or after **2026-08-26**, and again by **2026-09-02**.
-Run the full A/B as soon as any of the following occurs:
+The follow-up is tracked as an open repository item in
+[BACKLOG.md](BACKLOG.md). Run the full A/B when any of the following occurs:
 
 - the DFlash checkpoint revision changes;
 - #52816 changes head, merges, or enters an official aarch64 vLLM image;

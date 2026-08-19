@@ -79,7 +79,7 @@ DFlash 2 was evaluated live on this GB10 and remains an experimental candidate, 
 
 The fail-closed `VARIANT=dflash2` requires both `DFLASH2_EXPERIMENTAL=1` and a caller-supplied immutable `DFLASH2_IMAGE`, starts at one sequence with automatic KV profiling, and leaves normal `./start.sh` behavior unchanged. vLLM support is still open PR #52816; the RadixArk target also needs the checked-in NVFP4 LM-head patch, and DFlash compile caches are isolated by `MAX_SEQS` after a cross-concurrency AOT-cache failure. See [DFLASH2_EVALUATION.md](DFLASH2_EVALUATION.md) for the exact commits, reproducible build, raw-result locations, caveats, and gate decisions.
 
-Retest policy: check the pinned model and relevant vLLM PR heads weekly, starting 2026-08-26, and rerun the paired c=12 matrix when an artifact or cache implementation changes. Do not rerun identical bits merely because time passed; the exact triggers and promotion thresholds are in [DFLASH2_EVALUATION.md](DFLASH2_EVALUATION.md#retest-policy).
+Retesting is tracked in [BACKLOG.md](BACKLOG.md), keyed to pinned model and vLLM artifact changes rather than a calendar reminder. Do not rerun identical bits merely because time passed; the exact matrix and promotion thresholds are in [DFLASH2_EVALUATION.md](DFLASH2_EVALUATION.md#retest-policy).
 
 ### Serving settings (vLLM)
 
