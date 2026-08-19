@@ -4,6 +4,8 @@
 #   ./download.sh          RadixArk target + DSpark drafter (what the default
 #                          ./start.sh and ./start-sglang.sh serve)
 #   ./download.sh --mtp    unsloth checkpoint (for VARIANT=mtp / DSPARK_TARGET=unsloth)
+#   ./download.sh --dflash2
+#                          RadixArk target + experimental DFlash 2 drafter
 #   ./download.sh --all    everything
 #
 # HF_TOKEN is set (without export) in ~/.bashrc -> pick it up here.
@@ -12,11 +14,13 @@ cd "$(dirname "$0")"
 
 DEFAULT_REPOS=("RadixArk/Qwen3.8-27B-NVFP4" "RadixArk/Qwen3.8-27B-DSpark")
 MTP_REPOS=("unsloth/Qwen3.8-27B-NVFP4")
+DFLASH2_REPOS=("z-lab/Qwen3.8-27B-DFlash2")
 case "${1:-}" in
   "" | --sglang) REPOS=("${DEFAULT_REPOS[@]}") ;;
   --mtp)         REPOS=("${MTP_REPOS[@]}") ;;
-  --all)         REPOS=("${DEFAULT_REPOS[@]}" "${MTP_REPOS[@]}") ;;
-  *) echo "usage: download.sh [--mtp|--all]"; exit 1 ;;
+  --dflash2)     REPOS=("RadixArk/Qwen3.8-27B-NVFP4" "${DFLASH2_REPOS[@]}") ;;
+  --all)         REPOS=("${DEFAULT_REPOS[@]}" "${MTP_REPOS[@]}" "${DFLASH2_REPOS[@]}") ;;
+  *) echo "usage: download.sh [--mtp|--dflash2|--all]"; exit 1 ;;
 esac
 
 # Honor an HF_TOKEN already in the environment; fall back to ~/.bashrc

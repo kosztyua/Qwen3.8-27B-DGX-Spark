@@ -12,17 +12,17 @@ Ready-to-run scripts to serve **Qwen3.8-27B** on an NVIDIA DGX Spark (GB10, aarc
 |---|---|
 | Hardware | NVIDIA DGX Spark / GB10 (aarch64, sm_121a, 128 GB unified memory) |
 | Docker | With NVIDIA Container Toolkit / GPU passthrough working (`docker run --gpus all`) |
-| Disk | ~24 GB for the default checkpoints (+23 GB with `--all`), plus the engine images |
+| Disk | ~24 GB for the default checkpoints (+27 GB with `--all`, including DFlash 2), plus the engine images |
 | CLI tools | `docker`, `curl`, `python3`; the Hugging Face CLI (`hf`) for `download.sh` |
 | Hugging Face token | `HF_TOKEN` in `~/.bashrc` (higher rate limits; not strictly required) |
 
-Engine images are pinned by digest in the start scripts (the 2026-08-15 builds validated here): `vllm/vllm-openai@sha256:b5c860…` and `lmsysorg/sglang@sha256:febfb9…`. See [Known issues](#known-issues-and-safeguards) for why the vLLM pin matters.
+Engine images are pinned by digest in the start scripts (the 2026-08-15 builds validated here): `vllm/vllm-openai@sha256:b5c860…` and `lmsysorg/sglang@sha256:febfb9…`. See [Known issues](#known-issues-and-safeguards) for why the vLLM pin matters. The experimental DFlash 2 path cannot use that vLLM image; it requires an explicitly supplied, digest-pinned PR build and remains disabled by default.
 
 ## Quick start
 
 ```bash
 # 1. Download the default checkpoints into ./.cache/huggingface (retries, resumes)
-./download.sh              # add --mtp or --all for the unsloth checkpoint
+./download.sh              # add --mtp, --dflash2, or --all
 
 # 2. Start the server (waits until the API is ready, then exits)
 ./start.sh
@@ -43,7 +43,7 @@ The start scripts are idempotent: if their container is already running they say
 
 | Script | What it does |
 |---|---|
-| `download.sh` | Pre-downloads the RadixArk target + DSpark drafter (`--mtp` for the unsloth checkpoint, `--all` for everything) into `./.cache/huggingface`, with up to 10 attempts per repo. |
+| `download.sh` | Pre-downloads the RadixArk target + DSpark drafter (`--mtp` for unsloth, `--dflash2` for the experimental DFlash 2 drafter, `--all` for everything) into `./.cache/huggingface`, with up to 10 attempts per repo. |
 | `start.sh` | Launches the pinned vLLM container for the selected `VARIANT` (drafter auto-provisioned for dspark), streams logs to `.vllm.log`, waits for readiness, runs a speculative-decode health probe, and starts the runtime memory guard. |
 | `start-sglang.sh` | Launches the pinned SGLang container (RadixArk + DSpark; logs to `.sglang.log`), with the same memory pre-flight and a generation smoke test. |
 | `stop.sh` | Stops whichever engine container is running plus the memory guard; leaves the stopped container for `docker logs` post-mortem. |
@@ -72,6 +72,12 @@ Runtime artifacts (`.vllm.log`, `.sglang.log`, `.memguard.log`, pid files, `.cac
 Pick the default for interactive and batched work; `VARIANT=mtp` when you need the 1M context, validated vision input, or your traffic is genuinely unpredictable text; SGLang mainly for its 128k-depth prefill (~1,125 vs ~590 tok/s single-stream at that depth). There is also `VARIANT=dspark DSPARK_TARGET=unsloth ./start.sh`, which runs the DSpark drafter over the unsloth checkpoint: it works and still beats MTP on real content (39.1/34.6/30.9 tok/s), but is 10-30% behind the RadixArk target because vLLM's compressed-tensors kernels are ~12ms/step slower than the modelopt path and draft acceptance is lower against this target. Quant quality between the two checkpoints measured indistinguishable; see [Quant quality](#quant-quality-radixark-vs-unsloth).
 
 *SGLang's random-content lead comes partly from its looser draft verification: threshold-based acceptance rather than the lossless rejection sampling vLLM uses, trading exactness of the sampling distribution for speed.
+
+### Experimental DFlash 2 candidate
+
+DFlash 2 is a promising evaluation candidate, not a shipped default. Its authors report a 4.80 mean acceptance length versus 3.62 for this repository's DSpark drafter and 27-39% higher task throughput in a matched H200/SGLang comparison. Those results do not transfer directly to this NVFP4 GB10/vLLM stack, and vLLM support is still open PR #52816 with a reported concurrency crash on adjacent SM120 hardware.
+
+This branch prepares a fail-closed `VARIANT=dflash2`: it requires both `DFLASH2_EXPERIMENTAL=1` and a caller-supplied `DFLASH2_IMAGE` pinned by digest, starts at one sequence with automatic KV profiling, and leaves normal `./start.sh` behavior unchanged. See [DFLASH2_EVALUATION.md](DFLASH2_EVALUATION.md) for the evidence, risks, exact upstream commit reviewed, and staged promotion gates.
 
 ### Serving settings (vLLM)
 
