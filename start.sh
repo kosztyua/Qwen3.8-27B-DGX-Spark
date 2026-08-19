@@ -6,11 +6,13 @@ set -euo pipefail
 # Serves one of two NVFP4 checkpoints of the same base model, selected by
 # VARIANT (see the case block below). The default is the fastest measured
 # config on this box: RadixArk/Qwen3.8-27B-NVFP4 with DSpark speculative
-# decoding.
+# decoding. An explicitly gated dflash2 variant is present for evaluation;
+# it is not a production default and requires a separately supplied image.
 #
 # Notes that apply to every variant:
-#   - IMAGE IS PINNED BY DIGEST (v0.27.2rc1.dev110+gacb0f1dcd, the 2026-08-15
-#     nightly). Reasons: (a) stable 0.27.1 cannot load this model family
+#   - The normal IMAGE is pinned by digest (v0.27.2rc1.dev110+gacb0f1dcd, the
+#     2026-08-15 nightly); dflash2 requires its caller-supplied image to be
+#     digest-pinned too. Reasons: (a) stable 0.27.1 cannot load this model family
 #     ("MergedColumnParallelLinear has no attribute data"); (b) this nightly
 #     contains the SM12x FlashInfer XQA decode path (PR #49718) and the fused
 #     GDN MTP decode kernel (PR #51674), and an open revert (PR #51987) may
@@ -57,11 +59,18 @@ cd "$(dirname "$0")"
 #   VARIANT=mtp: unsloth checkpoint + its built-in MTP head (k=5). Best on
 #     unpredictable single-stream content (27.5 tok/s random c=1) and the
 #     only variant with the CONTEXT_1M option and vision validation.
+#   VARIANT=dflash2: experimental z-lab 1.9B DFlash 2 drafter (k=7) over the
+#     RadixArk target. Local GB10 c=1/c=4 decode tests are promising, but the
+#     candidate failed the prefill/TTFT promotion gates and vLLM support is
+#     still PR-only. It remains fail-closed behind DFLASH2_EXPERIMENTAL=1 and
+#     DFLASH2_IMAGE=<digest>.
 # The dspark drafter config needs its architectures field patched from
 # DSparkDraftModel (which vLLM's registry routes to a DeepSeek-V4 class) to
 # Qwen3DSparkModel; this script maintains a patched local copy automatically.
 VARIANT="${VARIANT:-dspark}"
-DRAFT_ID="RadixArk/Qwen3.8-27B-DSpark"
+DSPARK_DRAFT_ID="RadixArk/Qwen3.8-27B-DSpark"
+DFLASH2_DRAFT_ID="z-lab/Qwen3.8-27B-DFlash2"
+DFLASH2_DRAFT_REVISION="50307d4c4cde6860d4eee73e2547cd786fe8e8a4"
 DRAFT_LOCAL_DIR_NAME="dspark-qwen38-local"
 case "${VARIANT}" in
   mtp)
@@ -81,6 +90,7 @@ case "${VARIANT}" in
     DEFAULT_KV_CACHE_MEMORY=""
     ;;
   dspark)
+    DRAFT_ID="${DSPARK_DRAFT_ID}"
     # DSPARK_TARGET=radixark (default): fastest measured config overall.
     # DSPARK_TARGET=unsloth: same drafter over the unsloth checkpoint —
     # works, and still beats MTP on real content (39.1/34.6/30.9 tok/s),
@@ -114,19 +124,59 @@ case "${VARIANT}" in
     DEFAULT_MAX_SEQS=12
     DEFAULT_KV_CACHE_MEMORY=73014444032   # 68 GiB -> 1,274,196 tokens
     ;;
+  dflash2)
+    if [[ "${DFLASH2_EXPERIMENTAL:-0}" != "1" ]]; then
+      cat <<'MSG'
+VARIANT=dflash2 is experimental. Local DGX Spark testing found large decode
+gains at c=1/c=4, but it failed the prefill/TTFT promotion gates. Its vLLM
+support is still an open upstream PR and the NVFP4 target needs a local
+compatibility patch. See DFLASH2_EVALUATION.md.
+
+After building and pinning a compatible image, explicitly opt in with:
+
+    DFLASH2_EXPERIMENTAL=1 DFLASH2_IMAGE=<image@sha256:...|sha256:...> VARIANT=dflash2 ./start.sh
+MSG
+      exit 1
+    fi
+    if [[ -z "${DFLASH2_IMAGE:-}" ]]; then
+      echo "VARIANT=dflash2 requires DFLASH2_IMAGE pinned to an image containing vLLM PR #52816."
+      echo "The repository's normal pinned vLLM image predates DFlash 2 support."
+      exit 1
+    fi
+    if ! [[ "${DFLASH2_IMAGE}" =~ @sha256:[0-9a-f]{64}$|^sha256:[0-9a-f]{64}$ ]]; then
+      echo "DFLASH2_IMAGE must be a registry digest (...@sha256:<64 hex>) or local image ID (sha256:<64 hex>); tags are rejected."
+      exit 1
+    fi
+    MODEL_ID="RadixArk/Qwen3.8-27B-NVFP4"
+    SERVED_MODEL_NAME="qwen38-27b-radixark-nvfp4"
+    DRAFT_ID="${DFLASH2_DRAFT_ID}"
+    QUANT_ARGS=()
+    SPEC_CONFIG='{"method": "dflash", "model": "'"${DRAFT_ID}"'", "revision": "'"${DFLASH2_DRAFT_REVISION}"'", "num_speculative_tokens": 7}'
+    # c*(1+k) for c=1..8 at k=7
+    LADDER=(1 2 4 8 16 24 32 40 48 56 64)
+    SPEC_WIDTH=8
+    PROBE_MIN="0.50"
+    # Conservative evaluation defaults. Let vLLM profile the KV pool around
+    # the larger BF16 drafter, and prove single-stream stability before raising
+    # concurrency (the upstream SM120 report failed at c=4).
+    DEFAULT_MAX_SEQS=1
+    DEFAULT_KV_CACHE_MEMORY=""
+    ;;
   *)
-    echo "Unknown VARIANT '${VARIANT}' (expected 'mtp' or 'dspark')"
+    echo "Unknown VARIANT '${VARIANT}' (expected 'mtp', 'dspark', or 'dflash2')"
     exit 1
     ;;
 esac
 
 # ── tuning knobs ─────────────────────────────────────────────────────────────
 #
-# MAX_SEQS and KV_CACHE_MEMORY default to the measured optimum, which is NOT
-# what shipped before: the old behaviour is MAX_SEQS=8 KV_CACHE_MEMORY= (empty).
-# SSM_DTYPE and PROFILER default to off.
+# DSpark's MAX_SEQS and KV_CACHE_MEMORY default to its measured optimum, which
+# is NOT what shipped before: the old behaviour is MAX_SEQS=8
+# KV_CACHE_MEMORY= (empty). MTP retains its prior defaults; dFlash2 starts with
+# conservative evaluation defaults. SSM_DTYPE and PROFILER default to off.
 #
-# MAX_SEQS=<n>            Concurrent sequence cap; default 12, the measured knee.
+# MAX_SEQS=<n>            Concurrent sequence cap: dspark=12 (measured knee),
+#                         mtp=8, dflash2=1 (conservative initial evaluation).
 #                         The per-variant ladder above only covers c=1..8, so
 #                         anything higher must extend it or the wider decode
 #                         batches fall back to eager attention (PR #52000) —
@@ -138,7 +188,8 @@ esac
 #                         spend less of the run prefilling. c=16 was not measured
 #                         under the controlled method -- treat it as unknown.
 # KV_CACHE_MEMORY=<bytes> Pin the KV pool to an exact size instead of deriving it
-#                         from --gpu-memory-utilization. Deterministic across
+#                         from --gpu-memory-utilization. DSpark defaults to the
+#                         measured 68 GiB; MTP and dflash2 derive it. Deterministic across
 #                         restarts, where the utilization fraction is not: two
 #                         starts of the identical config measured 1,413,515 and
 #                         1,419,112 KV tokens, because 0.84 is a share of
@@ -158,6 +209,11 @@ esac
 #                         on acceptance length, not just output quality.
 #                         Use bfloat16, never float16: vLLM's fused GDN decode
 #                         path accepts only float32/bfloat16.
+# PREFIX_MATCH_UNIT=<n>   Optional fine-grained prefix-cache hash unit. Leave
+#                         empty for vLLM's resolved default (the GCD of hybrid
+#                         cache-group block sizes in the DFlash candidate).
+#                         Evaluation only: the active upstream cache fixes are
+#                         still unmerged, and an invalid divisor fails at boot.
 # PROFILER=1              Expose /start_profile and /stop_profile for a torch
 #                         trace. Only the exact value 1 enables it; anything else
 #                         (0, no, false, empty, unset) leaves it off. Development
@@ -165,18 +221,26 @@ esac
 #
 # Defaults come from the variant block above, because the tuning was measured on
 # dspark only: dspark defaults to the measured optimum (12 / 68 GiB), mtp keeps
-# the previously shipped 8 / utilization-derived. MAX_SEQS=8 with
-# KV_CACHE_MEMORY= (empty) restores the pre-tuning behaviour on either.
+# the previously shipped 8 / utilization-derived, and dflash2 deliberately
+# starts at 1 / utilization-derived. MAX_SEQS=8 with KV_CACHE_MEMORY= (empty)
+# restores the pre-tuning behaviour on dspark or mtp.
 MAX_SEQS="${MAX_SEQS:-${DEFAULT_MAX_SEQS}}"
 # Note the '-' rather than ':-': an explicitly empty KV_CACHE_MEMORY= means
 # "fall back to deriving the pool from --gpu-memory-utilization", while unset
 # means "use the variant default".
 KV_CACHE_MEMORY="${KV_CACHE_MEMORY-${DEFAULT_KV_CACHE_MEMORY}}"
+PREFIX_MATCH_UNIT="${PREFIX_MATCH_UNIT:-}"
 # Bounded because the ladder loop below allocates per iteration: MAX_SEQS=1e19
 # once grew a bash array until memguard killed the engine (2026-08-17). The
 # pattern rejects leading zeros, so the arithmetic below is unambiguous.
 if ! [[ "${MAX_SEQS}" =~ ^[1-9][0-9]{0,2}$ ]] || (( MAX_SEQS > 256 )); then
   echo "MAX_SEQS must be an integer between 1 and 256, got '${MAX_SEQS}'"
+  exit 1
+fi
+if [[ -n "${PREFIX_MATCH_UNIT}" ]] \
+   && { ! [[ "${PREFIX_MATCH_UNIT}" =~ ^[1-9][0-9]{0,5}$ ]] \
+        || (( PREFIX_MATCH_UNIT > 262144 )); }; then
+  echo "PREFIX_MATCH_UNIT must be empty or an integer between 1 and 262144, got '${PREFIX_MATCH_UNIT}'"
   exit 1
 fi
 if (( MAX_SEQS > 8 )); then
@@ -188,13 +252,22 @@ fi
 TUNING_ARGS=()
 [[ -n "${KV_CACHE_MEMORY:-}" ]] && TUNING_ARGS+=(--kv-cache-memory "${KV_CACHE_MEMORY}")
 [[ -n "${SSM_DTYPE:-}" ]]       && TUNING_ARGS+=(--mamba-ssm-cache-dtype "${SSM_DTYPE}")
+[[ -n "${PREFIX_MATCH_UNIT}" ]] && TUNING_ARGS+=(--prefix-match-unit "${PREFIX_MATCH_UNIT}")
 if [[ "${PROFILER:-0}" == "1" ]]; then
   TUNING_ARGS+=(--profiler-config '{"profiler": "torch", "torch_profiler_dir": "/root/.cache/huggingface/prof", "max_iterations": 5}')
 fi
 
 
-# Pinned: vllm/vllm-openai:nightly-aarch64 as of 2026-08-15 (see header notes)
-IMAGE="vllm/vllm-openai@sha256:b5c860acda75d737a8e58cc99ba86ff13982695dceae194f906c2d7b54979358"
+# Pinned: vllm/vllm-openai:nightly-aarch64 as of 2026-08-15 (see header notes).
+# DFlash 2 support landed after this build and remains PR-only, so that variant
+# must supply a separately built, digest-pinned image and can never silently
+# fall back to the normal image.
+DEFAULT_IMAGE="vllm/vllm-openai@sha256:b5c860acda75d737a8e58cc99ba86ff13982695dceae194f906c2d7b54979358"
+if [[ "${VARIANT}" == "dflash2" ]]; then
+  IMAGE="${DFLASH2_IMAGE}"
+else
+  IMAGE="${DEFAULT_IMAGE}"
+fi
 CONTAINER_NAME="qwen3.8-27b-nvfp4"
 SGLANG_CONTAINER_NAME="qwen3.8-27b-sglang"
 HOST="0.0.0.0"
@@ -208,6 +281,15 @@ VLLM_CACHE_DIR="${WORK_DIR}/.cache/vllm"
 FLASHINFER_CACHE_DIR="${WORK_DIR}/.cache/flashinfer"
 READY_URL="http://127.0.0.1:${PORT}/v1/models"
 
+# The current DFlash2 AOT key does not include the padded draft batch shape.
+# Reusing an artifact compiled at MAX_SEQS=1 for MAX_SEQS=4 fails profiling
+# with `expected size 4==1`. Keep its vLLM cache root concurrency-specific.
+# Other variants retain the historical cache location unchanged.
+VLLM_CACHE_ROOT_IN_CONTAINER="/root/.cache/vllm"
+if [[ "${VARIANT}" == "dflash2" ]]; then
+  VLLM_CACHE_ROOT_IN_CONTAINER="/root/.cache/vllm/dflash2-maxseqs-${MAX_SEQS}"
+fi
+
 # Context: native 262,144 tokens by default (no RoPE modification, no quality
 # caveat). CONTEXT_1M=1 ./start.sh extends to 1M via static YaRN (model card
 # "Processing Ultra-Long Texts": factor 4.0 over the native 262144, applied
@@ -217,8 +299,8 @@ READY_URL="http://127.0.0.1:${PORT}/v1/models"
 # concurrent 262k sequences or 2 x 1M.
 CONTEXT_ARGS=(--max-model-len 262144)
 if [[ "${CONTEXT_1M:-0}" == "1" ]]; then
-  if [[ "${VARIANT}" == "dspark" ]]; then
-    echo "CONTEXT_1M=1 is only validated with VARIANT=mtp (the YaRN recipe is untested on the RadixArk checkpoint)."
+  if [[ "${VARIANT}" != "mtp" ]]; then
+    echo "CONTEXT_1M=1 is only validated with VARIANT=mtp (the YaRN recipe is untested on the RadixArk checkpoint and external drafters)."
     exit 1
   fi
   CONTEXT_ARGS=(
@@ -264,18 +346,20 @@ if docker ps -a --format '{{.Names}}' | grep -qxF "${CONTAINER_NAME}"; then
       echo "  (container vanished while inspecting it; re-run ./start.sh)"
       exit 1
     fi
-    _live_seqs=""; _live_kv=""; _live_ssm=""
+    _live_seqs=""; _live_kv=""; _live_ssm=""; _live_prefix_unit=""
     for (( _i = 0; _i < ${#_live[@]}; _i++ )); do
       case "${_live[_i]}" in
         --max-num-seqs)          _live_seqs="${_live[_i+1]:-}" ;;
         --kv-cache-memory)       _live_kv="${_live[_i+1]:-}" ;;
         --mamba-ssm-cache-dtype) _live_ssm="${_live[_i+1]:-}" ;;
+        --prefix-match-unit)     _live_prefix_unit="${_live[_i+1]:-}" ;;
       esac
     done
     _drift=0
     [[ "${_live_seqs}" != "${MAX_SEQS}" ]] && { echo "  !! running --max-num-seqs ${_live_seqs:-<unset>}, this invocation wanted ${MAX_SEQS}"; _drift=1; }
     [[ "${_live_kv}" != "${KV_CACHE_MEMORY}" ]] && { echo "  !! running --kv-cache-memory ${_live_kv:-<unset>}, this invocation wanted ${KV_CACHE_MEMORY:-<unset>}"; _drift=1; }
     [[ "${_live_ssm}" != "${SSM_DTYPE:-}" ]] && { echo "  !! running --mamba-ssm-cache-dtype ${_live_ssm:-<unset>}, this invocation wanted ${SSM_DTYPE:-<unset>}"; _drift=1; }
+    [[ "${_live_prefix_unit}" != "${PREFIX_MATCH_UNIT}" ]] && { echo "  !! running --prefix-match-unit ${_live_prefix_unit:-<unset>}, this invocation wanted ${PREFIX_MATCH_UNIT:-<unset>}"; _drift=1; }
     if (( _drift )); then
       echo "  The running server does NOT match the requested configuration."
       echo "  Nothing was applied. Restart to apply it:  ./stop.sh && ./start.sh"
@@ -303,27 +387,37 @@ if [ "${mem_avail}" -lt 100 ]; then
 fi
 echo "OK: ${mem_avail} GiB available"
 
-# VARIANT=dspark: make sure the target checkpoint and the drafter are cached,
-# and maintain the patched local drafter copy (architectures field fix).
-if [[ "${VARIANT}" == "dspark" ]]; then
+# External-drafter variants: make sure the target and drafter are cached. For
+# DSpark only, also maintain the patched local copy (architectures field fix).
+if [[ "${VARIANT}" == "dspark" || "${VARIANT}" == "dflash2" ]]; then
   for repo in "${MODEL_ID}" "${DRAFT_ID}"; do
     cache_dir="${HF_HOME}/hub/models--${repo//\//--}"
-    if ! ls "${cache_dir}"/snapshots/*/*.safetensors >/dev/null 2>&1; then
+    snapshot_glob="${cache_dir}/snapshots/*/*.safetensors"
+    if [[ "${repo}" == "${DFLASH2_DRAFT_ID}" ]]; then
+      snapshot_glob="${cache_dir}/snapshots/${DFLASH2_DRAFT_REVISION}/*.safetensors"
+    fi
+    if ! compgen -G "${snapshot_glob}" >/dev/null; then
       echo "${repo} not in cache — downloading"
+      revision_kwarg=""
+      if [[ "${repo}" == "${DFLASH2_DRAFT_ID}" ]]; then
+        revision_kwarg=", revision='${DFLASH2_DRAFT_REVISION}'"
+      fi
       docker run --rm --network host \
         -e HF_HOME=/root/.cache/huggingface -e HF_TOKEN="${HF_TOKEN:-}" \
         -v "${HF_HOME}:/root/.cache/huggingface" \
         --entrypoint python3 "${IMAGE}" \
-        -c "from huggingface_hub import snapshot_download; snapshot_download('${repo}')"
+        -c "from huggingface_hub import snapshot_download; snapshot_download('${repo}'${revision_kwarg})"
     fi
   done
-  DRAFT_LOCAL="${HF_HOME}/${DRAFT_LOCAL_DIR_NAME}"
-  if [[ ! -s "${DRAFT_LOCAL}/model.safetensors" ]]; then
-    echo "Creating patched drafter copy at ${DRAFT_LOCAL} (architectures -> Qwen3DSparkModel)"
-    snap="$(ls -d "${HF_HOME}"/hub/models--RadixArk--Qwen3.8-27B-DSpark/snapshots/*/ | head -1)"
-    mkdir -p "${DRAFT_LOCAL}"
-    cp -L "${snap}/model.safetensors" "${DRAFT_LOCAL}/"
-    sed 's/"DSparkDraftModel"/"Qwen3DSparkModel"/' "${snap}/config.json" > "${DRAFT_LOCAL}/config.json"
+  if [[ "${VARIANT}" == "dspark" ]]; then
+    DRAFT_LOCAL="${HF_HOME}/${DRAFT_LOCAL_DIR_NAME}"
+    if [[ ! -s "${DRAFT_LOCAL}/model.safetensors" ]]; then
+      echo "Creating patched drafter copy at ${DRAFT_LOCAL} (architectures -> Qwen3DSparkModel)"
+      snap="$(ls -d "${HF_HOME}"/hub/models--RadixArk--Qwen3.8-27B-DSpark/snapshots/*/ | head -1)"
+      mkdir -p "${DRAFT_LOCAL}"
+      cp -L "${snap}/model.safetensors" "${DRAFT_LOCAL}/"
+      sed 's/"DSparkDraftModel"/"Qwen3DSparkModel"/' "${snap}/config.json" > "${DRAFT_LOCAL}/config.json"
+    fi
   fi
 fi
 
@@ -350,6 +444,7 @@ docker run -d \
   -e VLLM_FLOAT32_MATMUL_PRECISION=high \
   -e CUTE_DSL_ARCH=sm_121a \
   -e VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 \
+  -e VLLM_CACHE_ROOT="${VLLM_CACHE_ROOT_IN_CONTAINER}" \
   -e HF_HOME=/root/.cache/huggingface \
   -e TRITON_CACHE_DIR=/root/.triton \
   -e HF_TOKEN="${HF_TOKEN:-}" \
@@ -434,7 +529,7 @@ wait_ready || exit 1
 echo "vLLM is ready"
 echo "OpenAI base URL: http://${HOST}:${PORT}/v1"
 
-# ── MTP health probe ─────────────────────────────────────────────────────────
+# ── speculative-decoding health probe ─────────────────────────────────────────────
 # This vLLM build has a per-launch initialization lottery: some starts come up
 # with a mis-drafting speculative-decode state (MTP position-0 acceptance drops
 # from ~77% to ~44% and single-stream decode falls from ~27 to ~16 tok/s).
@@ -472,10 +567,10 @@ PY
 }
 
 if ! command -v python3 >/dev/null 2>&1; then
-  echo "WARNING: python3 not found on the host — skipping the MTP health probe."
+  echo "WARNING: python3 not found on the host — skipping the speculative-decode health probe."
   echo "If decode runs ~40% slower than expected (~16 instead of ~27 tok/s), restart with ./stop.sh && ./start.sh"
 else
-  echo "Probing speculative-decode health (MTP position-0 acceptance)..."
+  echo "Probing speculative-decode health (position-0 acceptance)..."
   if rate=$(probe_acceptance); then
     echo "Spec-decode acceptance healthy (position-0 rate ${rate})"
   else

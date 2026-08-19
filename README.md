@@ -12,17 +12,17 @@ Ready-to-run scripts to serve **Qwen3.8-27B** on an NVIDIA DGX Spark (GB10, aarc
 |---|---|
 | Hardware | NVIDIA DGX Spark / GB10 (aarch64, sm_121a, 128 GB unified memory) |
 | Docker | With NVIDIA Container Toolkit / GPU passthrough working (`docker run --gpus all`) |
-| Disk | ~24 GB for the default checkpoints (+23 GB with `--all`), plus the engine images |
+| Disk | ~24 GB for the default checkpoints (+27 GB with `--all`, including DFlash 2), plus the engine images |
 | CLI tools | `docker`, `curl`, `python3`; the Hugging Face CLI (`hf`) for `download.sh` |
 | Hugging Face token | `HF_TOKEN` in `~/.bashrc` (higher rate limits; not strictly required) |
 
-Engine images are pinned by digest in the start scripts (the 2026-08-15 builds validated here): `vllm/vllm-openai@sha256:b5c860…` and `lmsysorg/sglang@sha256:febfb9…`. See [Known issues](#known-issues-and-safeguards) for why the vLLM pin matters.
+Engine images are pinned by digest in the start scripts (the 2026-08-15 builds validated here): `vllm/vllm-openai@sha256:b5c860…` and `lmsysorg/sglang@sha256:febfb9…`. See [Known issues](#known-issues-and-safeguards) for why the vLLM pin matters. The experimental DFlash 2 path cannot use that vLLM image; it requires an explicitly supplied, digest-pinned PR build and remains disabled by default.
 
 ## Quick start
 
 ```bash
 # 1. Download the default checkpoints into ./.cache/huggingface (retries, resumes)
-./download.sh              # add --mtp or --all for the unsloth checkpoint
+./download.sh              # add --mtp, --dflash2, or --all
 
 # 2. Start the server (waits until the API is ready, then exits)
 ./start.sh
@@ -43,7 +43,7 @@ The start scripts are idempotent: if their container is already running they say
 
 | Script | What it does |
 |---|---|
-| `download.sh` | Pre-downloads the RadixArk target + DSpark drafter (`--mtp` for the unsloth checkpoint, `--all` for everything) into `./.cache/huggingface`, with up to 10 attempts per repo. |
+| `download.sh` | Pre-downloads the RadixArk target + DSpark drafter (`--mtp` for unsloth, `--dflash2` for the experimental DFlash 2 drafter, `--all` for everything) into `./.cache/huggingface`, with up to 10 attempts per repo. |
 | `start.sh` | Launches the pinned vLLM container for the selected `VARIANT` (drafter auto-provisioned for dspark), streams logs to `.vllm.log`, waits for readiness, runs a speculative-decode health probe, and starts the runtime memory guard. |
 | `start-sglang.sh` | Launches the pinned SGLang container (RadixArk + DSpark; logs to `.sglang.log`), with the same memory pre-flight and a generation smoke test. |
 | `stop.sh` | Stops whichever engine container is running plus the memory guard; leaves the stopped container for `docker logs` post-mortem. |
@@ -72,6 +72,14 @@ Runtime artifacts (`.vllm.log`, `.sglang.log`, `.memguard.log`, pid files, `.cac
 Pick the default for interactive and batched work; `VARIANT=mtp` when you need the 1M context, validated vision input, or your traffic is genuinely unpredictable text; SGLang mainly for its 128k-depth prefill (~1,125 vs ~590 tok/s single-stream at that depth). There is also `VARIANT=dspark DSPARK_TARGET=unsloth ./start.sh`, which runs the DSpark drafter over the unsloth checkpoint: it works and still beats MTP on real content (39.1/34.6/30.9 tok/s), but is 10-30% behind the RadixArk target because vLLM's compressed-tensors kernels are ~12ms/step slower than the modelopt path and draft acceptance is lower against this target. Quant quality between the two checkpoints measured indistinguishable; see [Quant quality](#quant-quality-radixark-vs-unsloth).
 
 *SGLang's random-content lead comes partly from its looser draft verification: threshold-based acceptance rather than the lossless rejection sampling vLLM uses, trading exactness of the sampling distribution for speed.
+
+### Experimental DFlash 2 candidate
+
+DFlash 2 was evaluated live on this GB10 and remains an experimental candidate, not the default. Matched 1k/1k decode tests improved from 21.92 to 35.90 tok/s at c=1 (+63.8%) and from 66.07 to 142.27 tok/s at c=4 (+115.3%). It was also stable at c=12. On the actual cache-heavy shape, however, the ~35k arm ran 8.7% longer because DFlash2 computed 52.1% more input tokens; an all-90k stress arm ran 38.8% longer after its effective cache reuse fell to zero. Cold warmups were faster or tied, so prefix-cache effectiveness—not an equally large raw prefill-kernel deficit—is the current promotion blocker.
+
+The fail-closed `VARIANT=dflash2` requires both `DFLASH2_EXPERIMENTAL=1` and a caller-supplied immutable `DFLASH2_IMAGE`, starts at one sequence with automatic KV profiling, and leaves normal `./start.sh` behavior unchanged. vLLM support is still open PR #52816; the RadixArk target also needs the checked-in NVFP4 LM-head patch, and DFlash compile caches are isolated by `MAX_SEQS` after a cross-concurrency AOT-cache failure. See [DFLASH2_EVALUATION.md](DFLASH2_EVALUATION.md) for the exact commits, reproducible build, raw-result locations, caveats, and gate decisions.
+
+Retest policy: check the pinned model and relevant vLLM PR heads weekly, starting 2026-08-26, and rerun the paired c=12 matrix when an artifact or cache implementation changes. Do not rerun identical bits merely because time passed; the exact triggers and promotion thresholds are in [DFLASH2_EVALUATION.md](DFLASH2_EVALUATION.md#retest-policy).
 
 ### Serving settings (vLLM)
 
@@ -172,11 +180,12 @@ Checkpoint sizes: RadixArk ~21.9 GB + 2.7 GB drafter; unsloth 22.6 GB including 
 
 ### Concurrency and KV sizing
 
-Measured 2026-08-17 with the `sess*` scenarios (see Methodology), which model the
-production shape: ~32k context, one 28k prefix per concurrent slot, high intra-session
-prefix reuse. Server held at `MAX_SEQS=20` with the pool pinned at 68 GiB so that **only
-client concurrency varies**; the ladder covered `c×8` up to 160 throughout. Labels
-`tune-A/B/D/E`, reproducible with `./bench-table.sh tune-`.
+Measured 2026-08-17 with the `sess*` scenarios (see Methodology), which model a
+cache-heavy multi-turn workload. The actual security-benchmark load is 12 sustained
+streams with context p50 ~35k, p95 ~90k, and max 128k. These older concurrency runs used
+32k input (one 28k prefix per slot), while holding the server at `MAX_SEQS=20` and the
+pool at 68 GiB so that **only client concurrency varied**; the ladder covered `c×8` up
+to 160 throughout. Labels `tune-A/B/D/E`, reproducible with `./bench-table.sh tune-`.
 
 **The measured result: +9.9% at 12 concurrent versus 8.** Six runs, three per arm,
 identical prompt set on both arms (12 prefixes, seed 11908, 3 turns), full server restart
@@ -192,9 +201,10 @@ c=12 run and the best c=8 run), so the difference is real. Acceptance length cam
 matched to within 1.7%, which is what should happen with identical prompts and is what
 makes the throughput comparison trustworthy. Zero failed requests, zero preemptions.
 
-These runs used `SESS_REQS=3`, so roughly 28% of wall clock is prefill. Production
-sessions run ~28 turns, where prefill is a much smaller share and concurrency helps the
-decode phase more — so **+9.9% is likely a floor for real traffic, not a ceiling**.
+These runs used `SESS_REQS=3`, so roughly 28% of wall clock is prefill. The
+security workload is cache-heavy but has a much wider context distribution, so
+the +9.9% establishes a c=12 scheduling gain for this synthetic shape; it is not
+a bound on the real workload's gain.
 
 **Two earlier figures in this section were wrong and are withdrawn.** A claimed +33% came
 from hand-picked steady-state windows; a claimed +27% came from whole-run data where each
@@ -207,10 +217,9 @@ cache (measured: 90.5% of the second arm's input tokens were cache hits).
 plateau rather than a regression, but that evidence has the same defect as the withdrawn
 +27%, so treat 16 as unmeasured.
 
-**Raising `MAX_SEQS` alone does nothing.** The engine has to be *offered* the extra work:
-with 8 client connections, `num_requests_waiting` sat at 0 across 3,915 scheduler samples
-of production traffic. This is a paired change — server cap and client worker count move
-together.
+**Raising `MAX_SEQS` alone does nothing.** The engine has to be *offered* the
+extra work. The security harness does supply 12 sustained streams, so the server
+cap and benchmark worker count should remain paired at 12.
 
 ### GDN state precision (`SSM_DTYPE`)
 
@@ -277,7 +286,7 @@ Long context under `VARIANT=mtp` (single stream, 128k-token prompt, 1M-YaRN conf
 ### Methodology
 
 - Speculative acceptance (and therefore tok/s) is strongly content-dependent. Compare configs on step time (ITL) and acceptance length separately; `bench.sh` pins its seeds so prompts are identical across runs, and servers should be restarted between config comparisons so the prefix cache is cold.
-- **Scenario choice matters more than it looks.** `dec1`/`dec4`/`pre16k` use 1k–16k random-token prompts. Production traffic here is ~32k median context with 89.6% prefix-cache hits arriving as multi-turn sessions, and concurrency measured on short random prompts does not predict concurrency on that shape. The `sess8`/`sess12`/`sess16`/`sess20` scenarios use the `prefix_repetition` dataset: one 28k prefix per concurrent slot, `SESS_REQS` turns of 4k suffix against it. `SESS_REQS=12` (the default) puts prefill at roughly 18% of wall clock and recorded acceptance 2.390 in `tune-D-s20-kv68/sess12.json`, close to the 2.42–2.46 seen in production; `SESS_REQS=4` puts prefill at roughly 28% and reads acceptance 2.5–3.5, i.e. optimistically. (Those percentages are solved from `tune-B/sess12` vs `tune-D/sess12` — identical config, 4 vs 12 turns — not from 1/n, which is the fraction of *turns* that are cold rather than the fraction of time spent prefilling.)
+- **Scenario choice matters more than it looks.** `dec1`/`dec4`/`pre16k` use 1k–16k random-token prompts. The actual security-benchmark workload holds 12 streams continuously, with context p50 ~35k, p95 ~90k, max 128k, and heavy context-cache reuse; concurrency on short random prompts does not predict that shape. The `sess4`/`sess8`/`sess12`/`sess16`/`sess20` scenarios use the `prefix_repetition` dataset, and `SESS_PREFIX_LEN`, `SESS_SUFFIX_LEN`, and `SESS_OUTPUT_LEN` make the shape configurable. The historical 28k-prefix + 4k-suffix default remains useful, but DFlash2 was also tested at 32,768 + 3,072 = 35,840 input and 86,016 + 4,096 = 90,112 input. `SESS_REQS=12` puts prefill at roughly 18% of wall clock in the historical case; `SESS_REQS=4` puts it at roughly 28%. (Those percentages are solved from `tune-B/sess12` vs `tune-D/sess12`—identical config, 4 vs 12 turns—not from 1/n, which is the fraction of *turns* that are cold rather than time spent prefilling.)
 - **For concurrency comparisons use `seq-steps/s` = `steps/s × seqs/step`, not tok/s.** Engine steps come from `vllm:iteration_tokens_total_count`; `vllm:spec_decode_num_drafts_total` counts one draft per *sequence* per step, so `drafts/iterations` is the mean batch occupancy. Because `num_prefixes` tracks concurrency, each `sess<c>` benchmarks a different prompt set, and acceptance differences between them are content artifacts rather than concurrency effects — `seq-steps/s` is invariant to that and `tok/s` is not.
 - `./bench-table.sh [label-prefix …]` renders `bench-results/` as a markdown comparison table.
 - Don't measure vLLM throughput from streaming timestamps: it flushes stream deltas in multi-token bursts, which can inflate first-token-to-last-token rates about 2×. Use wall-clock timing or `bench.sh`.
@@ -295,7 +304,7 @@ Long context under `VARIANT=mtp` (single stream, 128k-token prompt, 1M-YaRN conf
 - **MTP k=3 is broken in this build**: single-stream decode mis-drafts and collapses to ~15 tok/s (reproduced twice). k=5 is the measured MTP optimum.
 - **FlashInfer attention mis-drafts at high concurrency**: +8% prefill and slightly faster single-stream in A/B, but spec-decode batches at width 24 mis-draft (c=4 falls to 53.3 tok/s), the same kernel family as upstream revert #51987. `triton_attn` stays the default until that settles.
 - **Launch lottery + health probe**: some vLLM launches come up with a mis-drafting speculative state on a bit-identical config (measured under MTP: position-0 acceptance ~44% instead of ~77%, decode ~16 instead of ~27 tok/s); a container restart fixes it. After readiness, `start.sh` probes the acceptance counters and restarts once automatically if position-0 acceptance is below the variant's threshold (0.55 for mtp, 0.25 for dspark, whose position-0 rate is legitimately lower).
-- **Prefix caching is currently defeated by speculative decoding** on this hybrid-GDN model (PR #52244 tracks the fix), so multi-turn conversations re-pay the full prefill each turn.
+- **Hybrid speculative prefix caching remains incomplete, not universally defeated.** In the matched c=12 DFlash2 test, DSpark reused 60.9% versus DFlash2 40.5% of input tokens at the ~35k point; in the all-90k stress arm, DSpark reused 28.9% and DFlash2 0%. This made DFlash2 compute 52% and 41% more input tokens respectively, overwhelming its decode advantage. The median arm proves reuse can work, while [#50897](https://github.com/vllm-project/vllm/pull/50897), [#52244](https://github.com/vllm-project/vllm/pull/52244), and [#47930](https://github.com/vllm-project/vllm/issues/47930) track remaining lookahead hashing, GDN/MTP cache, and warmed-cache correctness work. See `DFLASH2_EVALUATION.md`.
 - **Unified-memory freeze protection**: a memory spiral on the GB10 freezes the whole machine, and container `--memory` caps cannot prevent it because GPU/unified allocations bypass the container cgroup (one hard freeze observed on this box during an engine start while the previous engine's memory was still held). Two safeguards cover it: the start scripts refuse to boot until 100 GiB is actually free, and `memguard.sh` kills the engine container if available memory stays under 4 GiB at runtime.
 - **Day-1 tokenizer bug (unsloth checkpoint)**: copies downloaded before 2026-08-15 silently truncated every prompt to 2,048 tokens. Verify `truncation` is `None` in the cached `tokenizer.json`, or re-run `./download.sh --mtp`.
 

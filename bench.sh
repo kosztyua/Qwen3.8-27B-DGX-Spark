@@ -18,17 +18,18 @@
 #   long128k c=1, 128k-token prompts, 256-token generations (long context;
 #            needs CONTEXT_1M=1 or any config with max-model-len > 128k)
 #
-# Session scenarios (sess8/sess12/sess16/sess20) use the prefix_repetition
+# Session scenarios (sess4/sess8/sess12/sess16/sess20) use the prefix_repetition
 # dataset instead of random, because the random scenarios above measure the
-# wrong regime for this box's production traffic. Measured production shape:
-# ~32k median context, 89.6% prefix-cache hit rate, ~850-token generations,
-# arriving as multi-turn agentic sessions rather than independent prompts.
-# The scenario approximates that but cannot match the hit rate: a 28,672-token
-# prefix of a 32,768-token request caps reuse at 87.5%, and the achievable rate
-# is 80.2% at SESS_REQS=12 (65.6% at 4), since the first turn of each session is
-# always cold.
-# Each scenario creates one 28k prefix per concurrent slot and runs SESS_REQS
-# (default 12) 4k-suffix requests against each, so intra-session prefix reuse
+# wrong regime for this box's production traffic. The target shape is 12
+# sustained security-benchmark streams, context p50 ~35k / p95 ~90k / max
+# 128k, roughly 850-token generations, and heavy multi-turn prefix reuse.
+# The defaults preserve the historical 28,672-token prefix + 4,096-token
+# suffix case; SESS_PREFIX_LEN, SESS_SUFFIX_LEN, and SESS_OUTPUT_LEN can match
+# other points in the observed distribution. The first request for each prefix
+# is necessarily cold.
+# Each scenario creates one prefix per concurrent slot and runs SESS_REQS
+# requests against each. Prefix/suffix lengths default to 28k/4k but are
+# configurable, so a run can match the observed context distribution. Reuse
 # and per-session KV residency both behave like the real thing. Note the
 # dataset shuffles all requests before dispatch, so turns of a given prefix do
 # not run strictly in order or one-at-a-time -- reuse and residency hold, but
@@ -70,7 +71,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-KNOWN_SCENARIOS=",dec1,dec4,pre16k,long128k,sess8,sess12,sess16,sess20,"
+KNOWN_SCENARIOS=",dec1,dec4,pre16k,long128k,sess4,sess8,sess12,sess16,sess20,"
 IFS=',' read -ra _sc <<<"${SCENARIOS}"
 for _s in "${_sc[@]}"; do
   [[ "${KNOWN_SCENARIOS}" == *",${_s},"* ]] \
@@ -106,6 +107,11 @@ failures=0
 run_scenario() {
   local name="$1" seed="$2"; shift 2
   echo "=== scenario ${name} (seed ${seed}) $(date -Is) ==="
+  # Persist exact server-counter boundaries alongside the client JSON. This
+  # makes cache-hit, prefill-compute, and speculative-acceptance deltas
+  # reconstructible without trusting rolling log summaries.
+  curl -fsS -m 10 "http://127.0.0.1:${PORT}/metrics" \
+    >"${HOST_RESULTS}/${name}.metrics.before" || true
   docker run --rm --network host \
     -e HF_HOME=/root/.cache/huggingface \
     -v "${HF_HOME}:/root/.cache/huggingface" \
@@ -124,9 +130,12 @@ run_scenario() {
     --save-result --result-dir "${CTR_RESULTS}" --result-filename "${name}.json" \
     --label "${LABEL}-${name}" \
     "$@" 2>&1 | tee "${HOST_RESULTS}/${name}.log" | tail -50
+  local bench_status="${PIPESTATUS[0]}"
+  curl -fsS -m 10 "http://127.0.0.1:${PORT}/metrics" \
+    >"${HOST_RESULTS}/${name}.metrics.after" || true
   # `vllm bench serve` exits 0 and still writes a complete JSON when every
   # request failed, so the exit code alone is not a success signal.
-  if [[ "${PIPESTATUS[0]}" != "0" || ! -s "${HOST_RESULTS}/${name}.json" ]] \
+  if [[ "${bench_status}" != "0" || ! -s "${HOST_RESULTS}/${name}.json" ]] \
      || ! python3 -c 'import json,sys
 d = json.load(open(sys.argv[1]))
 if d.get("failed"):
@@ -155,10 +164,11 @@ want long128k && run_scenario long128k 11802 \
   --random-input-len 131072 --random-output-len 256 \
   --num-prompts 2 --max-concurrency 1
 
-# One 28k prefix per concurrent slot, SESS_REQS 4k-suffix requests against each.
-# Total input 32,768 tokens per request; 1k generations. Seeds differ per concurrency so a
-# rerun of the same scenario is reproducible, but note the prompt set is not
-# identical across concurrencies by construction (num_prefixes == c).
+# One prefix per concurrent slot, with SESS_REQS requests against each. The
+# defaults total 32,768 input tokens and request 1,024 output tokens. Seeds
+# differ per concurrency so a rerun of the same scenario is reproducible, but
+# the prompt set is not identical across concurrencies by construction
+# (num_prefixes == c).
 # SESS_REQS controls turns per session. It sets how much of the run is prefill,
 # which is the single biggest lever on whether a concurrency comparison is fair:
 # every session pays one full 32k prefill on its first turn and only 4k per turn
@@ -167,8 +177,14 @@ want long128k && run_scenario long128k 11802 \
 # tune-D/sess12, identical config at 4 vs 12 turns), prefill is ~18% of wall
 # clock at SESS_REQS=12 and ~28% at 4. It cannot fall much below ~12-18% at any
 # turn count, because every turn still prefills its own 4k suffix -- so this
-# scenario always weights prefill more heavily than production does.
+# scenario always weights prefill more heavily than a long-lived cache-hot
+# session does.
 SESS_REQS="${SESS_REQS:-12}"
+# Default remains the historical 1k. Override it to match a measured workload
+# (for example SESS_OUTPUT_LEN=850 for this host's ~816-token median final call).
+SESS_OUTPUT_LEN="${SESS_OUTPUT_LEN:-1024}"
+SESS_PREFIX_LEN="${SESS_PREFIX_LEN:-28672}"
+SESS_SUFFIX_LEN="${SESS_SUFFIX_LEN:-4096}"
 # SESS_PREFIXES pins the number of distinct prefixes (sessions). It defaults to
 # the concurrency, which is the realistic shape -- one session per slot -- but
 # that makes each sess<c> a DIFFERENT prompt set, so acceptance length (and
@@ -197,11 +213,18 @@ SESS_SEED="${SESS_SEED:-}"
 # sizes a benchmark run, and an unbounded value produces either a nonsense
 # --num-prompts or a run that never ends. Digit count is capped in the pattern so
 # a huge literal never reaches $(( )).
-for _v in SESS_REQS SESS_PREFIXES; do
+for _v in SESS_REQS SESS_PREFIXES SESS_OUTPUT_LEN; do
   _val="${!_v}"
   [[ -z "${_val}" ]] && continue
   if ! [[ "${_val}" =~ ^[1-9][0-9]{0,3}$ ]]; then
     echo "${_v} must be an integer between 1 and 9999, got '${_val}'"
+    exit 1
+  fi
+done
+for _v in SESS_PREFIX_LEN SESS_SUFFIX_LEN; do
+  _val="${!_v}"
+  if ! [[ "${_val}" =~ ^[1-9][0-9]{0,5}$ ]] || (( _val > 262144 )); then
+    echo "${_v} must be an integer between 1 and 262144, got '${_val}'"
     exit 1
   fi
 done
@@ -212,13 +235,14 @@ sess() {
   local prompts="${SESS_PREFIXES:+$((SESS_PREFIXES * SESS_REQS))}"
   prompts="${prompts:-$((c * SESS_REQS))}"
   DATASET=prefix_repetition run_scenario "sess${c}" "${seed}" \
-    --prefix-repetition-prefix-len 28672 \
-    --prefix-repetition-suffix-len 4096 \
-    --prefix-repetition-output-len 1024 \
+    --prefix-repetition-prefix-len "${SESS_PREFIX_LEN}" \
+    --prefix-repetition-suffix-len "${SESS_SUFFIX_LEN}" \
+    --prefix-repetition-output-len "${SESS_OUTPUT_LEN}" \
     --prefix-repetition-num-prefixes "${prefixes}" \
     --num-prompts "${prompts}" --max-concurrency "${c}"
 }
 
+want sess4  && sess 4  11904
 want sess8  && sess 8  11908
 want sess12 && sess 12 11912
 want sess16 && sess 16 11916

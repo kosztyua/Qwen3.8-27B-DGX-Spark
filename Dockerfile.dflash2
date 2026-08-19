@@ -1,0 +1,18 @@
+ARG BASE_IMAGE=vllm/vllm-openai@sha256:b0e84e5f2b00a7268e4fdda332790ebd4bfb166b64757e166914753afaeee965
+FROM ${BASE_IMAGE}
+
+# Runtime-only overlay of vLLM PR #52816, rebased without conflicts onto the
+# exact source commit embedded in BASE_IMAGE (5a4c8d99242e...). The build
+# context must also have patches/vllm-dflash2-nvfp4-lm-head.patch applied; see
+# DFLASH2_EVALUATION.md for the reproducible checkout commands.
+LABEL ai.vllm.dflash2.pr="52816" \
+      ai.vllm.dflash2.upstream-commit="19c9351904df4c63042671bc67a866ca48dc7d6f" \
+      ai.vllm.dflash2.base-commit="5a4c8d99242e9e069b604d0e9b969e77f7dd501d" \
+      ai.vllm.dflash2.nvfp4-lm-head-patch-sha256="99daf34e98f69a507784e6f006a3777a97dc56261b67e4e337867c37efc072f3"
+
+COPY vllm/config/vllm.py /usr/local/lib/python3.12/dist-packages/vllm/config/vllm.py
+COPY vllm/model_executor/models/qwen3_dflash.py /usr/local/lib/python3.12/dist-packages/vllm/model_executor/models/qwen3_dflash.py
+COPY vllm/model_executor/models/qwen3_dflash2.py /usr/local/lib/python3.12/dist-packages/vllm/model_executor/models/qwen3_dflash2.py
+COPY vllm/model_executor/models/registry.py /usr/local/lib/python3.12/dist-packages/vllm/model_executor/models/registry.py
+COPY vllm/v1/worker/gpu/spec_decode/__init__.py /usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu/spec_decode/__init__.py
+COPY vllm/v1/worker/gpu/spec_decode/dflash2/ /usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu/spec_decode/dflash2/
