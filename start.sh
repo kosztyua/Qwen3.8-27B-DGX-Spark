@@ -209,6 +209,11 @@ esac
 #                         on acceptance length, not just output quality.
 #                         Use bfloat16, never float16: vLLM's fused GDN decode
 #                         path accepts only float32/bfloat16.
+# PREFIX_MATCH_UNIT=<n>   Optional fine-grained prefix-cache hash unit. Leave
+#                         empty for vLLM's resolved default (the GCD of hybrid
+#                         cache-group block sizes in the DFlash candidate).
+#                         Evaluation only: the active upstream cache fixes are
+#                         still unmerged, and an invalid divisor fails at boot.
 # PROFILER=1              Expose /start_profile and /stop_profile for a torch
 #                         trace. Only the exact value 1 enables it; anything else
 #                         (0, no, false, empty, unset) leaves it off. Development
@@ -224,11 +229,18 @@ MAX_SEQS="${MAX_SEQS:-${DEFAULT_MAX_SEQS}}"
 # "fall back to deriving the pool from --gpu-memory-utilization", while unset
 # means "use the variant default".
 KV_CACHE_MEMORY="${KV_CACHE_MEMORY-${DEFAULT_KV_CACHE_MEMORY}}"
+PREFIX_MATCH_UNIT="${PREFIX_MATCH_UNIT:-}"
 # Bounded because the ladder loop below allocates per iteration: MAX_SEQS=1e19
 # once grew a bash array until memguard killed the engine (2026-08-17). The
 # pattern rejects leading zeros, so the arithmetic below is unambiguous.
 if ! [[ "${MAX_SEQS}" =~ ^[1-9][0-9]{0,2}$ ]] || (( MAX_SEQS > 256 )); then
   echo "MAX_SEQS must be an integer between 1 and 256, got '${MAX_SEQS}'"
+  exit 1
+fi
+if [[ -n "${PREFIX_MATCH_UNIT}" ]] \
+   && { ! [[ "${PREFIX_MATCH_UNIT}" =~ ^[1-9][0-9]{0,5}$ ]] \
+        || (( PREFIX_MATCH_UNIT > 262144 )); }; then
+  echo "PREFIX_MATCH_UNIT must be empty or an integer between 1 and 262144, got '${PREFIX_MATCH_UNIT}'"
   exit 1
 fi
 if (( MAX_SEQS > 8 )); then
@@ -240,6 +252,7 @@ fi
 TUNING_ARGS=()
 [[ -n "${KV_CACHE_MEMORY:-}" ]] && TUNING_ARGS+=(--kv-cache-memory "${KV_CACHE_MEMORY}")
 [[ -n "${SSM_DTYPE:-}" ]]       && TUNING_ARGS+=(--mamba-ssm-cache-dtype "${SSM_DTYPE}")
+[[ -n "${PREFIX_MATCH_UNIT}" ]] && TUNING_ARGS+=(--prefix-match-unit "${PREFIX_MATCH_UNIT}")
 if [[ "${PROFILER:-0}" == "1" ]]; then
   TUNING_ARGS+=(--profiler-config '{"profiler": "torch", "torch_profiler_dir": "/root/.cache/huggingface/prof", "max_iterations": 5}')
 fi
@@ -333,18 +346,20 @@ if docker ps -a --format '{{.Names}}' | grep -qxF "${CONTAINER_NAME}"; then
       echo "  (container vanished while inspecting it; re-run ./start.sh)"
       exit 1
     fi
-    _live_seqs=""; _live_kv=""; _live_ssm=""
+    _live_seqs=""; _live_kv=""; _live_ssm=""; _live_prefix_unit=""
     for (( _i = 0; _i < ${#_live[@]}; _i++ )); do
       case "${_live[_i]}" in
         --max-num-seqs)          _live_seqs="${_live[_i+1]:-}" ;;
         --kv-cache-memory)       _live_kv="${_live[_i+1]:-}" ;;
         --mamba-ssm-cache-dtype) _live_ssm="${_live[_i+1]:-}" ;;
+        --prefix-match-unit)     _live_prefix_unit="${_live[_i+1]:-}" ;;
       esac
     done
     _drift=0
     [[ "${_live_seqs}" != "${MAX_SEQS}" ]] && { echo "  !! running --max-num-seqs ${_live_seqs:-<unset>}, this invocation wanted ${MAX_SEQS}"; _drift=1; }
     [[ "${_live_kv}" != "${KV_CACHE_MEMORY}" ]] && { echo "  !! running --kv-cache-memory ${_live_kv:-<unset>}, this invocation wanted ${KV_CACHE_MEMORY:-<unset>}"; _drift=1; }
     [[ "${_live_ssm}" != "${SSM_DTYPE:-}" ]] && { echo "  !! running --mamba-ssm-cache-dtype ${_live_ssm:-<unset>}, this invocation wanted ${SSM_DTYPE:-<unset>}"; _drift=1; }
+    [[ "${_live_prefix_unit}" != "${PREFIX_MATCH_UNIT}" ]] && { echo "  !! running --prefix-match-unit ${_live_prefix_unit:-<unset>}, this invocation wanted ${PREFIX_MATCH_UNIT:-<unset>}"; _drift=1; }
     if (( _drift )); then
       echo "  The running server does NOT match the requested configuration."
       echo "  Nothing was applied. Restart to apply it:  ./stop.sh && ./start.sh"
