@@ -42,6 +42,66 @@ a rebase. This evaluation therefore tested the active upstream DFlash head; it
 did not freeze vLLM at an older support state, but the pending fixes were not
 available to include.
 
+## Retest policy
+
+Retest DFlash 2, but do not spend another multi-hour run on identical artifacts.
+The first evaluation happened less than 24 hours after the checkpoint appeared,
+so rapid follow-up changes are plausible. At the close of this evaluation the
+reproducibility anchors were:
+
+- DFlash model revision `50307d4c4cde6860d4eee73e2547cd786fe8e8a4`, last
+  modified 2026-08-19 02:52 UTC;
+- integration PR #52816 head `19c9351904df4c63042671bc67a866ca48dc7d6f`;
+- lookahead-hashing PR #50897 head
+  `2b7eaf105a364ee2a9873cde24049b8bb40dd635`; and
+- hybrid GDN cache PR #52244 head
+  `62cbf34259002207e237eec5b5af79f75cc1606c`.
+
+Review those anchors on or after **2026-08-26**, and again by **2026-09-02**.
+Run the full A/B as soon as any of the following occurs:
+
+- the DFlash checkpoint revision changes;
+- #52816 changes head, merges, or enters an official aarch64 vLLM image;
+- #50897 or #52244 merges, is rebased into #52816, or equivalent cache work
+  lands on the candidate build; or
+- upstream supports the RadixArk NVFP4 target without the local LM-head patch.
+
+If none of the artifacts changed, record the status check and defer the GPU
+test; a bit-identical rerun will mostly measure run-to-run noise. Do not follow
+an unpinned moving tag: record the candidate image digest, vLLM commit, PR head,
+and model revision before every retest.
+
+The minimum retest is the same c=12 matrix used here so results remain paired:
+
+```bash
+# Run each arm after a fresh server start; use the same seed for both variants.
+SESS_REQS=4 SESS_OUTPUT_LEN=850 SESS_PREFIX_LEN=32768 \
+SESS_SUFFIX_LEN=3072 SESS_PREFIXES=12 SESS_SEED=12358 \
+./bench.sh <variant>-p50-c12-<date> --scenarios sess12
+
+# Deliberately severe cache/prefill stress arm, not a production distribution.
+SESS_REQS=2 SESS_OUTPUT_LEN=64 SESS_PREFIX_LEN=86016 \
+SESS_SUFFIX_LEN=4096 SESS_PREFIXES=12 SESS_SEED=12890 \
+./bench.sh <variant>-p95-c12-<date> --scenarios sess12
+```
+
+Capture metric boundaries, zero failures/preemptions, effective prefix-cache
+hit rate, newly computed input tokens, TTFT, TPOT, E2EL, throughput, acceptance
+length, and warmed-cache position-0 acceptance. Before changing the default,
+require all of the following:
+
+- DFlash cache hit rate is no more than 5 percentage points below DSpark and
+  computed input tokens are no more than 5% higher in both cache arms;
+- p50-shaped wall time improves by at least 5%, while the all-90k stress arm is
+  no more than 5% slower;
+- warmed prefix reuse does not collapse draft acceptance;
+- the 128k capacity, deterministic correctness, sampled-quality, and vision
+  checks pass; and
+- the quantized-target path no longer depends on an unreviewed local patch.
+
+Restore and health-check the pinned DSpark default after every experimental
+run, regardless of outcome.
+
 ## Production-shaped c=12 cache A/B
 
 The deployment workload is 12 continuously active security-benchmark streams,
